@@ -378,7 +378,7 @@ static int init_kernel(kaddr_t base)
 
 #ifdef __LP64__
 /* pangu9 method */
-static void sbWriteCode(uint64_t shc, uint64_t x30_reg, uint64_t origret, uint64_t next)
+static void sbWriteCode(uint64_t shc, uint64_t x30_reg, uint64_t equal, uint64_t next)
 {
     /*
      * Replace _memset.stub with shellcode in the following policy hook functions,
@@ -414,10 +414,10 @@ static void sbWriteCode(uint64_t shc, uint64_t x30_reg, uint64_t origret, uint64
      *
      */
     
-    DEBUGLog("%llx: %llx, next: %llx", x30_reg, origret, next);
+    DEBUGLog("%llx: %llx, next: %llx", x30_reg, equal, next);
     
                                   // _shellcode: check x30 register to branch which function it came from.
-    wk32(shc + 0x00, 0x58000110); //     ldr        x16, _lr_ptr
+    wk32(shc + 0x00, 0x58000110); //     ldr        x16, _x30_reg
     wk32(shc + 0x04, 0xeb1003df); //     cmp        x30, x16
     wk32(shc + 0x08, 0x54000060); //     b.eq       _ret0
     wk32(shc + 0x0c, 0x58000128); //     ldr        x8, _next
