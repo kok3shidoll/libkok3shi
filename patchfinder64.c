@@ -11,6 +11,7 @@
 //  Copyright (c) 2021 sakuRdev. All rights reserved.
 //
 
+#ifdef __LP64__
 
 #include "patchfinder64.h"
 
@@ -2120,3 +2121,5 @@ find_register_value(uint8_t* kernel, uint64_t where, int reg)
     }
     return val + kerndumpbase;
 }
+
+#endif
