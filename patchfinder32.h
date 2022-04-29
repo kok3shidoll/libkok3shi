@@ -49,6 +49,10 @@ uint32_t find_sandbox_mac_policy_ops(uint32_t region, uint8_t* kdata, size_t ksi
 uint32_t find_sb_PE_i_can_has_debugger_got(uint32_t region, uint8_t* kdata, size_t ksize, uint32_t ops);
 uint32_t find_sb_vfs_rootvnode_got(uint32_t region, uint8_t* kdata, size_t ksize, uint32_t ops);
 uint32_t find_rootvnode_offset(uint32_t region, uint8_t* kdata, size_t ksize, uint32_t fn);
+
+uint32_t find_allproc(uint32_t region, uint8_t* kdata, size_t ksize);
+uint32_t find_tfp0_patch(uint32_t region, uint8_t* kdata, size_t ksize);
+
 #endif
 
 #endif

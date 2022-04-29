@@ -1595,4 +1595,130 @@ uint32_t find_rootvnode_offset(uint32_t region, uint8_t* kdata, size_t ksize, ui
     return find_pc_rel_value(region, kdata, ksize, current_instruction, rd);
 }
 
+uint32_t find_allproc(uint32_t region, uint8_t* kdata, size_t ksize)
+{
+    const char *str = "shutdownwait";
+    uint8_t* point = memmem(kdata, ksize, str, strlen(str));
+    if(!point)
+        return 0;
+    
+    uint16_t* ref = find_literal_ref(region, kdata, ksize, (uint16_t*) kdata, (uintptr_t)point - (uintptr_t)kdata);
+    if(!ref)
+        return 0;
+    
+    // Find the first PC-relative reference in this function.
+    int found = 0;
+    uint16_t* current_instruction = ref;
+    while((uintptr_t)current_instruction < (uintptr_t)(kdata + ksize))
+    {
+        if(insn_is_movt(current_instruction))
+        {
+            found = 1;
+            current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
+            break;
+        }
+        
+        current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
+    }
+    
+    if(!found)
+        return 0;
+    
+    found = 0;
+    int rd;
+    while((uintptr_t)current_instruction < (uintptr_t)(kdata + ksize))
+    {
+        if(insn_is_add_reg(current_instruction) && insn_add_reg_rm(current_instruction) != 7)
+        {
+            found = 1;
+            rd = insn_add_reg_rd(current_instruction);
+            current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
+            break;
+        }
+        
+        current_instruction += insn_is_32bit(current_instruction) ? 2 : 1;
+    }
+    
+    if(!found)
+        return 0;
+    
+    uint32_t val = find_pc_rel_value(region, kdata, ksize, current_instruction, rd);
+    if(!val)
+        return 0;
+    
+    uint16_t* ref2 = find_literal_ref(region, kdata, ksize, (uint16_t*) current_instruction, (uintptr_t)point - (uintptr_t)kdata);
+    if(!ref)
+        return 0;
+    
+    // LDR
+    int found2 = 0;
+    int val2 = 0;
+    uint16_t* current_instruction2 = ref2;
+    while((uintptr_t)current_instruction2 < (uintptr_t)(kdata + ksize))
+    {
+        if(insn_is_ldr_imm(current_instruction2))
+        {
+            found2 = 1;
+            val2 = insn_ldr_imm_imm(current_instruction2) << 2;
+            current_instruction2 += insn_is_32bit(current_instruction2) ? 2 : 1;
+            break;
+        }
+        current_instruction2 += insn_is_32bit(current_instruction2) ? 2 : 1;
+    }
+    
+    if(!found2)
+        return 0;
+    
+    if(!val2)
+        return 0;
+    
+    return val + val2;
+}
+
+// NOP out the conditional branch here.
+uint32_t find_tfp0_patch(uint32_t region, uint8_t* kdata, size_t ksize)
+{
+    // Find the beginning of task_for_pid function
+    const struct find_search_mask search_masks[] =
+    {
+        {0xF8FF, 0x9003}, // str rx, [sp, #0xc]
+        {0xF8FF, 0x9002}, // str rx, [sp, #0x8]
+        {0xF800, 0x2800}, // cmp rx, #0
+        {0xFBC0, 0xF000}, // beq  <-- NOP
+        {0xD000, 0x8000},
+        {0xF800, 0xF000}, // bl _port_name_to_task
+        {0xF800, 0xF800},
+        {0xF8FF, 0x9003}, // str rx, [sp, #0xc]
+        {0xF800, 0x2800}, // cmp rx, #0
+        {0xFBC0, 0xF000}, // beq
+        {0xD000, 0x8000}
+    };
+    
+    const struct find_search_mask search_masks_A5[] =
+    {
+        {0xF8FF, 0x9003}, // str rx, [sp, #0xc]
+        {0xF800, 0x2800}, // cmp rx, #0         // why?!
+        {0xF8FF, 0x9002}, // str rx, [sp, #0x8]
+        {0xFBC0, 0xF000}, // beq  <-- NOP
+        {0xD000, 0x8000},
+        {0xF800, 0xF000}, // bl _port_name_to_task
+        {0xF800, 0xF800},
+        {0xF8FF, 0x9003}, // str rx, [sp, #0xc]
+        {0xF800, 0x2800}, // cmp rx, #0
+        {0xFBC0, 0xF000}, // beq
+        {0xD000, 0x8000}
+    };
+    
+    uint16_t* fn_start = find_with_search_mask(region, kdata, ksize, sizeof(search_masks) / sizeof(*search_masks), search_masks);
+    
+    if(!fn_start) {
+        fn_start = find_with_search_mask(region, kdata, ksize, sizeof(search_masks_A5) / sizeof(*search_masks_A5), search_masks_A5);
+        if(!fn_start) {
+            return 0;
+        }
+    }
+    
+    return ((uintptr_t)fn_start) + 6 - ((uintptr_t)kdata);
+}
+
 #endif

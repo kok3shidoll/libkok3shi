@@ -581,6 +581,7 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type)
     
 #ifndef __LP64__
     // legacy
+    kaddr_t tfp0_patch;
     kaddr_t vm_fault_enter;
     kaddr_t vm_map_enter;
     kaddr_t vm_map_protect;
@@ -927,6 +928,9 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type)
         if(!(csops = KOFFSET(region, find_csops(region, kdata, ksize)))) goto fail;
         if(!(pmap_location = KOFFSET(region, find_pmap_location(region, kdata, ksize)))) goto fail;
         
+        // task_for_pid
+        if(!(tfp0_patch = KOFFSET(region, find_tfp0_patch(region, kdata, ksize)))) goto fail;
+        
         kaddr_t pmap_store = rkptr(pmap_location);
         if(!pmap_store) {
             DEBUGLog("[ERROR] Failed to read offset!");
@@ -1129,7 +1133,7 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type)
         wkptr(sb_memset_got, sbBase);
 #else
         {
-            printf("[Sandbox] MAC policies\n");
+            printLog("[Sandbox] MAC policies");
             wk32(sbops+offsetof(struct mac_policy_ops, mpo_proc_check_fork), 0);
             wk32(sbops+offsetof(struct mac_policy_ops, mpo_iokit_check_open), 0);
             wk32(sbops+offsetof(struct mac_policy_ops, mpo_mount_check_fsctl), 0);
@@ -1166,6 +1170,11 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type)
     printLog("[*] Patching kernel");
     // KPP does not exist on 32-bit devices
     {
+        printLog("[*] task_for_pid(0)");
+        patch_page_table(tte_virt, tte_phys, (tfp0_patch & ~0xFFF));
+        wk32(tfp0_patch, 0xBF00BF00);
+        usleep(10000);
+        
         printLog("[*] vm_fault_enter");
         patch_page_table(tte_virt, tte_phys, (vm_fault_enter & ~0xFFF));
         wk16(vm_fault_enter, 0x2201);
