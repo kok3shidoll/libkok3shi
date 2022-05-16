@@ -1,8 +1,8 @@
 /*
- *  unjail9.h
+ *  kernel.h
  *  kokeshidoll
  *
- *  Created by sakuRdev on 2021/12/02.
+ *  Created by sakuRdev on 2022/05/17.
  *  Copyright (c) 2021 - 2022 sakuRdev. All rights reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,25 +25,32 @@
  *
  */
 
-#ifndef unjail9_h
-#define unjail9_h
+#ifndef kernel_h
+#define kernel_h
 
-#include <dlfcn.h>
-#include <copyfile.h>
-#include <stdio.h>
-#include <spawn.h>
-#include <unistd.h>
 #include <mach/mach.h>
-#include <mach-o/dyld.h>
-#include <sys/stat.h>
-#include <sys/mount.h>
-#include <sys/utsname.h>
-#include <Foundation/Foundation.h>
 
 #include "common.h"
 
-extern mach_port_t tfp0;
+kern_return_t mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+kern_return_t mach_vm_write(vm_map_t target_task, mach_vm_address_t address, vm_offset_t data, mach_msg_type_number_t dataCnt);
+kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
+kern_return_t mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
 
-int unjail9(mach_port_t pt, kaddr_t region, int lwvm_type, int kpp);
+void copyin(void* to, kaddr_t from, size_t size);
+void copyout(kaddr_t to, void* from, size_t size);
 
-#endif /* unjail9_h */
+#ifdef __LP64__
+uint64_t rk64(uint64_t addr);
+uint64_t wk64(uint64_t addr, uint64_t val);
+#endif
+
+uint32_t rk32(kaddr_t addr);
+kaddr_t wk32(kaddr_t addr, uint32_t val);
+__unused kaddr_t wk16(kaddr_t addr, uint16_t val);
+__unused kaddr_t wk8(kaddr_t addr, uint8_t val);
+
+kaddr_t rkptr(kaddr_t addr);
+kaddr_t wkptr(kaddr_t addr, kaddr_t val);
+
+#endif /* kernel_h */

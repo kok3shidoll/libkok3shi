@@ -1,8 +1,8 @@
 /*
- *  unjail9.h
+ *  common.h
  *  kokeshidoll
  *
- *  Created by sakuRdev on 2021/12/02.
+ *  Created by sakuRdev on 2022/05/17.
  *  Copyright (c) 2021 - 2022 sakuRdev. All rights reserved.
  *
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,25 +25,28 @@
  *
  */
 
-#ifndef unjail9_h
-#define unjail9_h
+#ifndef common_h
+#define common_h
 
-#include <dlfcn.h>
-#include <copyfile.h>
-#include <stdio.h>
-#include <spawn.h>
-#include <unistd.h>
-#include <mach/mach.h>
-#include <mach-o/dyld.h>
-#include <sys/stat.h>
-#include <sys/mount.h>
-#include <sys/utsname.h>
-#include <Foundation/Foundation.h>
+#ifdef DEBUG
+#define DEBUGLog(str, args...)\
+do\
+{\
+NSLog(@str, ##args);\
+} while(0)
+#else
+#define DEBUGLog(str, args...)
+#endif
 
-#include "common.h"
+#ifdef __LP64__
+#include "patchfinder64.h"
+#define KERNEL_HEADER_SIZE (0x4000)
+#define KERNEL_BASE_ADDRESS (0xffffff8004004000)
+typedef uint64_t kaddr_t;
+#else
+#include "patchfinder32.h"
+typedef uint32_t kaddr_t;
+#define KERNEL_HEADER_SIZE (0x1000)
+#endif
 
-extern mach_port_t tfp0;
-
-int unjail9(mach_port_t pt, kaddr_t region, int lwvm_type, int kpp);
-
-#endif /* unjail9_h */
+#endif /* common_h */

@@ -156,7 +156,7 @@ static int insn_ldrb_imm_imm(uint16_t* i)
     return ((*i >> 6) & 0x1F);
 }
 
-static int insn_is_ldr_reg(uint16_t* i)
+__unused static int insn_is_ldr_reg(uint16_t* i)
 {
     if((*i & 0xFE00) == 0x5800)
         return 1;
@@ -166,7 +166,7 @@ static int insn_is_ldr_reg(uint16_t* i)
         return 0;
 }
 
-static int insn_ldr_reg_rn(uint16_t* i)
+__unused static int insn_ldr_reg_rn(uint16_t* i)
 {
     if((*i & 0xFE00) == 0x5800)
         return (*i >> 3) & 0x7;
@@ -196,7 +196,7 @@ int insn_ldr_reg_rm(uint16_t* i)
         return 0;
 }
 
-static int insn_ldr_reg_lsl(uint16_t* i)
+__unused static int insn_ldr_reg_lsl(uint16_t* i)
 {
     if((*i & 0xFE00) == 0x5800)
         return 0;
@@ -305,7 +305,7 @@ static int insn_mov_imm_imm(uint16_t* i)
         return 0;
 }
 
-static int insn_is_cmp_imm(uint16_t* i)
+__unused static int insn_is_cmp_imm(uint16_t* i)
 {
     if((*i & 0xF800) == 0x2800)
         return 1;
@@ -315,7 +315,7 @@ static int insn_is_cmp_imm(uint16_t* i)
         return 0;
 }
 
-static int insn_cmp_imm_rn(uint16_t* i)
+__unused static int insn_cmp_imm_rn(uint16_t* i)
 {
     if((*i & 0xF800) == 0x2800)
         return (*i >> 8) & 7;
@@ -325,7 +325,7 @@ static int insn_cmp_imm_rn(uint16_t* i)
         return 0;
 }
 
-static int insn_cmp_imm_imm(uint16_t* i)
+__unused static int insn_cmp_imm_imm(uint16_t* i)
 {
     if((*i & 0xF800) == 0x2800)
         return *i & 0xFF;
@@ -335,22 +335,22 @@ static int insn_cmp_imm_imm(uint16_t* i)
         return 0;
 }
 
-static int insn_is_and_imm(uint16_t* i)
+__unused static int insn_is_and_imm(uint16_t* i)
 {
     return (*i & 0xFBE0) == 0xF000 && (*(i + 1) & 0x8000) == 0;
 }
 
-static int insn_and_imm_rn(uint16_t* i)
+__unused static int insn_and_imm_rn(uint16_t* i)
 {
     return *i & 0xF;
 }
 
-static int insn_and_imm_rd(uint16_t* i)
+__unused static int insn_and_imm_rd(uint16_t* i)
 {
     return (*(i + 1) >> 8) & 0xF;
 }
 
-static int insn_and_imm_imm(uint16_t* i)
+__unused static int insn_and_imm_imm(uint16_t* i)
 {
     return thumb_expand_imm_c(((*i & 0x0400) << 1) | ((*(i + 1) & 0x7000) >> 4) | (*(i + 1) & 0xFF));
 }

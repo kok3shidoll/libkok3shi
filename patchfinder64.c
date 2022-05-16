@@ -151,7 +151,7 @@ __unused static int insn_is_ldr_literal_64(uint32_t* i)
     return 0;
 }
 
-static int insn_nop_64(uint32_t *i)
+__unused static int insn_nop_64(uint32_t *i)
 {
     return (*i == 0xD503201F);
 }
@@ -2012,10 +2012,7 @@ uint64_t find_task_for_pid(uint64_t region, uint8_t* kdata, size_t ksize)
     
 }
 
-
-
-//  xerub's patchfinder64.c
-//  Copyright (c) 2017 xerub. All rights reserved.
+// xerub's patchfinder
 
 extern uint64_t kerndumpbase;
 //extern uint64_t xnucore_base;
@@ -2054,11 +2051,11 @@ calc64(const uint8_t *buf, uint64_t start, uint64_t end, int which)
             signed adr = ((op & 0x60000000) >> 18) | ((op & 0xFFFFE0) << 8);
             //printf("%llx: ADRP X%d, 0x%llx\n", i, reg, ((long long)adr << 1) + (i & ~0xFFF));
             value[reg] = ((long long)adr << 1) + (i & ~0xFFF);
-            /*} else if ((op & 0xFFE0FFE0) == 0xAA0003E0) {
-             unsigned rd = op & 0x1F;
-             unsigned rm = (op >> 16) & 0x1F;
-             //printf("%llx: MOV X%d, X%d\n", i, rd, rm);
-             value[rd] = value[rm];*/
+            //} else if ((op & 0xFFE0FFE0) == 0xAA0003E0) {
+            // unsigned rd = op & 0x1F;
+            // unsigned rm = (op >> 16) & 0x1F;
+            // //printf("%llx: MOV X%d, X%d\n", i, rd, rm);
+            // value[rd] = value[rm];
         } else if ((op & 0xFF000000) == 0x91000000) {
             unsigned rn = (op >> 5) & 0x1F;
             unsigned shift = (op >> 22) & 3;
