@@ -1,6 +1,7 @@
 /*
  * mac.h: mac_policy list
  *
+ *
  */
 
 #ifndef MAC_H
@@ -8,10 +9,11 @@
 
 #include <stdint.h>
 
-#include "unjail9.h"
+#include "common.h"
 
 //#define MAC_POLICY_OPS_VERSION 39 /* inc when new reserved slots are taken */
-struct mac_policy_ops{
+//#define MAC_POLICY_OPS_VERSION 39 /* inc when new reserved slots are taken */
+struct mac_policy_ops {
     kaddr_t mpo_audit_check_postselect;
     kaddr_t mpo_audit_check_preselect;
     kaddr_t mpo_bpfdesc_label_associate;
@@ -348,5 +350,99 @@ struct mac_policy_ops{
     kaddr_t mpo_iokit_check_filter_properties;
     kaddr_t mpo_iokit_check_get_property;
 } __attribute__((packed));
+
+#ifdef __LP64__
+struct mpo_hook_list {
+    kaddr_t proc_check_fork_ret;
+    kaddr_t proc_check_fork_lr;
+    
+    kaddr_t iokit_check_open_ret;
+    kaddr_t iokit_check_open_lr;
+    
+    kaddr_t mount_check_fsctl_ret;
+    kaddr_t mount_check_fsctl_lr;
+    
+    kaddr_t vnode_check_rename_ret;
+    kaddr_t vnode_check_rename_lr_1;
+    kaddr_t vnode_check_rename_lr_2;
+    kaddr_t vnode_check_rename_lr_3;
+    kaddr_t vnode_check_rename_lr_4;
+    
+    kaddr_t vnode_check_access_ret;
+    kaddr_t vnode_check_access_lr;
+    
+    kaddr_t vnode_check_chroot_ret;
+    kaddr_t vnode_check_chroot_lr;
+    
+    kaddr_t vnode_check_create_ret;
+    kaddr_t vnode_check_create_lr_1;
+    kaddr_t vnode_check_create_lr_2;
+    kaddr_t vnode_check_create_lr_3;
+    
+    kaddr_t vnode_check_deleteextattr_ret;
+    kaddr_t vnode_check_deleteextattr_lr;
+    
+    kaddr_t vnode_check_exchangedata_ret;
+    kaddr_t vnode_check_exchangedata_lr_1;
+    kaddr_t vnode_check_exchangedata_lr_2;
+    
+    kaddr_t vnode_check_getattrlist_ret;
+    kaddr_t vnode_check_getattrlist_lr;
+    
+    kaddr_t vnode_check_getextattr_ret;
+    kaddr_t vnode_check_getextattr_lr;
+    
+    kaddr_t vnode_check_ioctl_ret;
+    kaddr_t vnode_check_ioctl_lr;
+    
+    kaddr_t vnode_check_link_ret;
+    kaddr_t vnode_check_link_lr_1;
+    kaddr_t vnode_check_link_lr_2;
+    kaddr_t vnode_check_link_lr_3;
+    
+    kaddr_t vnode_check_listextattr_ret;
+    kaddr_t vnode_check_listextattr_lr;
+    
+    kaddr_t vnode_check_open_ret;
+    kaddr_t vnode_check_open_lr;
+    
+    kaddr_t vnode_check_readlink_ret;
+    kaddr_t vnode_check_readlink_lr;
+    
+    kaddr_t vnode_check_revoke_ret;
+    kaddr_t vnode_check_revoke_lr;
+    
+    kaddr_t vnode_check_setattrlist_ret;
+    kaddr_t vnode_check_setattrlist_lr;
+    
+    kaddr_t vnode_check_setextattr_ret;
+    kaddr_t vnode_check_setextattr_lr;
+    
+    kaddr_t vnode_check_setflags_ret;
+    kaddr_t vnode_check_setflags_lr;
+    
+    kaddr_t vnode_check_setmode_ret;
+    kaddr_t vnode_check_setmode_lr;
+    
+    kaddr_t vnode_check_setowner_ret;
+    kaddr_t vnode_check_setowner_lr;
+    
+    kaddr_t vnode_check_setutimes_ret;
+    kaddr_t vnode_check_setutimes_lr;
+    
+    kaddr_t vnode_check_stat_ret;
+    kaddr_t vnode_check_stat_lr;
+    
+    kaddr_t vnode_check_truncate_ret;
+    kaddr_t vnode_check_truncate_lr;
+    
+    kaddr_t vnode_check_unlink_ret;
+    kaddr_t vnode_check_unlink_lr_1;
+    kaddr_t vnode_check_unlink_lr_2;
+    
+    kaddr_t file_check_mmap_ret;
+    kaddr_t file_check_mmap_lr;
+} __attribute__((packed));
+#endif
 
 #endif
