@@ -79,7 +79,7 @@ uint64_t level1_table = 0;
 uint64_t ttbr1_el1 = 0;
 
 #else
-// aarch64
+// aarch32
 
 // serch __TEXT free area
 kaddr_t text_vmaddr = 0;
@@ -428,7 +428,7 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type, int kpp)
 #endif
     
 #ifndef __LP64__
-    // get r00t
+    // get root
     kaddr_t allproc;
     if(!(allproc = KOFFSET(region, find_allproc(region, kdata, ksize)))) goto fail;
     
@@ -882,7 +882,7 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type, int kpp)
             if(!(lwvm_krnl_conf_got = KOFFSET(region, find_PE_i_can_has_kernel_configuration_got(region, kdata, ksize)))) goto fail;
         } else {
 #ifdef __LP64__
-            // -9.3.1
+            // 9.2?-9.3.1
             if(!(lwvm_krnl_conf_got = KOFFSET(region, find_LwVM_PE_i_can_has_debugger_got(region, kdata, ksize)))) goto fail;
 #else
             // TODO
@@ -1423,7 +1423,7 @@ static int kpatch9(kaddr_t region, kaddr_t lwvm_type, int kpp)
     sleep(1);
     
     {
-        // remount (rootless...)
+        // remount (kppless...)
         vm_offset_t v_mount_off = 0;
         vm_offset_t v_flag_off = 0;
 #ifdef __LP64__
